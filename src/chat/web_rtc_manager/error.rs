@@ -13,10 +13,9 @@ pub enum RTCError {
 
     #[error("Invalid WebRTC offer")]
     InvalidOffer,
-
-    #[error("WebRTC connection error: {0}")]
+    /*     #[error("WebRTC connection error: {0}")]
     ConnectionError(String),
 
     #[error("State error: {0}")]
-    StateError(String),
+    StateError(String), */
 }
