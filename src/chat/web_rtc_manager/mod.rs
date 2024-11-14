@@ -1,8 +1,10 @@
 mod config;
+pub mod connection_state;
 mod error;
-pub mod state;
-use crate::chat::chat_model::{ChatModel, ConnectionString, Msg};
+use super::chat_model::{ChatModelMessage, ConnectionString, Message, MessageSender};
 use base64::{self, prelude::BASE64_STANDARD, Engine};
+use config::RTCConfig;
+use connection_state::State;
 use error::RTCError;
 use js_sys::JSON;
 use serde::{Deserialize, Serialize};
@@ -17,15 +19,10 @@ use web_sys::{
     RtcIceCandidateInit, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection,
     RtcPeerConnectionIceEvent, RtcSessionDescriptionInit,
 };
-use yew::html::Scope;
-
-use config::RTCConfig;
-use state::State;
-
-use super::chat_model::{Message, MessageSender};
 
 type SingleArgClosure = Closure<dyn FnMut(JsValue)>;
 type SingleArgJsFn = Box<dyn FnMut(JsValue)>;
+type MessageCallback = Rc<dyn Fn(ChatModelMessage)>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IceCandidate {
@@ -35,7 +32,7 @@ pub struct IceCandidate {
 }
 
 pub trait NetworkManager {
-    fn new(link: &Scope<ChatModel<Self>>) -> Result<Rc<RefCell<Self>>, RTCError>
+    fn new(message_callback: MessageCallback) -> Result<Rc<RefCell<Self>>, RTCError>
     where
         Self: Sized;
     fn send_message(&self, message_content: &str);
@@ -56,11 +53,11 @@ pub struct WebRTCManager {
     exit_offer_or_answer_early: bool,
     ice_candidates: Vec<IceCandidate>,
     offer: Option<String>,
-    parent_link: Scope<ChatModel<Self>>,
+    message_callback: MessageCallback,
 }
 
 impl NetworkManager for WebRTCManager {
-    fn new(link: &Scope<ChatModel<Self>>) -> Result<Rc<RefCell<Self>>, RTCError> {
+    fn new(message_callback: MessageCallback) -> Result<Rc<RefCell<Self>>, RTCError> {
         Ok(Rc::new(RefCell::new(WebRTCManager {
             state: State::Default,
             rtc_peer_connection: None,
@@ -68,7 +65,7 @@ impl NetworkManager for WebRTCManager {
             config: RTCConfig::default(),
             ice_candidates: Vec::new(),
             offer: None,
-            parent_link: link.clone(),
+            message_callback,
             exit_offer_or_answer_early: false,
         })))
     }
@@ -241,10 +238,7 @@ impl NetworkManager for WebRTCManager {
             )
             .expect("alert should work");
 
-            web_rtc_manager_rc_clone
-                .borrow()
-                .parent_link
-                .send_message(Msg::ResetWebRTC);
+            (web_rtc_manager_rc_clone.borrow().message_callback)(ChatModelMessage::ResetWebRTC);
         }) as SingleArgJsFn);
 
         let connection_string = Rc::new(connection_string);
@@ -410,7 +404,6 @@ impl NetworkManager for WebRTCManager {
 }
 
 impl WebRTCManager {
-    // TODO : handle error when adding ice_candidate
     fn set_candidates(
         web_rtc_manager: Rc<RefCell<WebRTCManager>>,
         connection_string: &ConnectionString,
@@ -492,10 +485,9 @@ impl WebRTCManager {
 
             let web_rtc_state = web_rtc_manager.borrow().get_state();
 
-            web_rtc_manager
-                .borrow()
-                .parent_link
-                .send_message(Msg::UpdateWebRTCState(web_rtc_state));
+            (web_rtc_manager.borrow().message_callback)(ChatModelMessage::UpdateWebRTCState(
+                web_rtc_state,
+            ));
         }) as SingleArgJsFn)
     }
 
@@ -506,10 +498,7 @@ impl WebRTCManager {
             let msg_content: String = message_event.data().as_string().unwrap();
             let msg = Message::new(msg_content, MessageSender::Other);
 
-            web_rtc_manager
-                .borrow()
-                .parent_link
-                .send_message(Msg::NewMessage(msg));
+            (web_rtc_manager.borrow().message_callback)(ChatModelMessage::NewMessage(msg));
         }) as SingleArgJsFn)
     }
 
@@ -541,10 +530,9 @@ impl WebRTCManager {
 
             let web_rtc_state = web_rtc_manager.borrow().get_state();
 
-            web_rtc_manager
-                .borrow()
-                .parent_link
-                .send_message(Msg::UpdateWebRTCState(web_rtc_state));
+            (web_rtc_manager.borrow().message_callback)(ChatModelMessage::UpdateWebRTCState(
+                web_rtc_state,
+            ));
         }) as SingleArgJsFn)
     }
 
@@ -575,10 +563,9 @@ impl WebRTCManager {
             web_rtc_manager.borrow_mut().set_state(new_state);
             let web_rtc_state = web_rtc_manager.borrow().get_state();
 
-            web_rtc_manager
-                .borrow()
-                .parent_link
-                .send_message(Msg::UpdateWebRTCState(web_rtc_state));
+            (web_rtc_manager.borrow().message_callback)(ChatModelMessage::UpdateWebRTCState(
+                web_rtc_state,
+            ));
         }) as SingleArgJsFn)
     }
 

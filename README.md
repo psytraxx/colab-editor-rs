@@ -74,4 +74,6 @@ There are two empty spaces in the MIT license you need to fill out: `` and `Eric
 [trunk]: https://github.com/thedodd/trunk
 
 
-
+trunk build --release
+cd dist/
+npx http-server -o  .

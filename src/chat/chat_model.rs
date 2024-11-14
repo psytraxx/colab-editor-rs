@@ -1,3 +1,7 @@
+use super::web_rtc_manager::{
+    connection_state::{ConnectionState, State},
+    IceCandidate, NetworkManager,
+};
 use base64::{self, prelude::BASE64_STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -7,10 +11,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{console, Element, HtmlInputElement, InputEvent, RtcDataChannelState};
 use yew::{html, html::NodeRef, Component, Context, Html, KeyboardEvent, TargetCast};
-
-use crate::chat::web_rtc_manager::state::State;
-
-use super::web_rtc_manager::{state::ConnectionState, IceCandidate, NetworkManager};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MessageSender {
@@ -33,26 +33,25 @@ impl Message {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConnectionString {
     pub ice_candidates: Vec<IceCandidate>,
-    pub offer: String, // TODO : convert as JsValue using Json.Parse
+    pub offer: String,
 }
+
 pub struct ChatModel<T: NetworkManager + 'static> {
     web_rtc_manager: Rc<RefCell<T>>,
     messages: Vec<Message>,
-    value: String,
-    chat_value: String,
+    text_input: String,
     node_ref: NodeRef,
 }
 
 #[derive(Clone, Debug)]
-pub enum Msg {
+pub enum ChatModelMessage {
     StartAsServer,
     ConnectToServer,
     UpdateWebRTCState(State),
     Disconnect,
-    Send,
+    SendMessage,
     NewMessage(Message),
-    UpdateInputValue(String),
-    UpdateInputChatValue(String),
+    UpdateTextInput(String),
     OnKeyUp(KeyboardEvent),
     CopyToClipboard,
     ValidateOffer,
@@ -60,283 +59,148 @@ pub enum Msg {
 }
 
 impl<T: NetworkManager + 'static> Component for ChatModel<T> {
-    type Message = Msg;
+    type Message = ChatModelMessage;
     type Properties = ();
 
     fn create(ctx: &Context<Self>) -> Self {
         ChatModel {
-            web_rtc_manager: T::new(ctx.link()).expect("Failed to create WebRTC manager"),
+            web_rtc_manager: T::new(create_message_callback(ctx))
+                .expect("Failed to create WebRTC manager"),
             messages: vec![],
-            value: "".into(),
-            chat_value: "".into(),
+            text_input: "".into(),
             node_ref: NodeRef::default(),
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        // fn update(&mut self, msg: Self::Message) -> ShouldRender {
         match msg {
-            Msg::StartAsServer => {
-                self.web_rtc_manager
-                    .borrow_mut()
-                    .set_state(State::Server(ConnectionState::new()));
-                T::start_web_rtc(self.web_rtc_manager.clone())
-                    .expect("Failed to start WebRTC manager");
-
-                true
+            ChatModelMessage::StartAsServer => self.start_as_server(),
+            ChatModelMessage::ConnectToServer => self.connect_to_server(),
+            ChatModelMessage::UpdateWebRTCState(web_rtc_state) => {
+                self.update_webrtc_state(web_rtc_state)
             }
-
-            Msg::ConnectToServer => {
-                self.web_rtc_manager
-                    .borrow_mut()
-                    .set_state(State::Client(ConnectionState::new()));
-                T::start_web_rtc(self.web_rtc_manager.clone())
-                    .expect("Failed to start WebRTC manager");
-
-                true
-            }
-
-            Msg::UpdateWebRTCState(web_rtc_state) => {
-                self.value = "".into();
-                let debug = get_debug_state_string(&web_rtc_state);
-                console::log_1(&debug.into());
-
-                // let debug = self.get_serialized_offer_and_candidates();
-                // let hash = hmac_sha256::Hash::hash(debug.as_bytes());
-                // let hash_as_string = hex::encode(hash);
-                // console::log_1(&hash_as_string.into());
-
-                true
-            }
-
-            Msg::ResetWebRTC => {
-                self.web_rtc_manager = T::new(ctx.link()).expect("Failed to create WebRTC manager");
-                self.messages = vec![];
-                self.chat_value = "".into();
-                self.value = "".into();
-
-                true
-            }
-
-            Msg::UpdateInputValue(val) => {
-                self.value = val;
-
-                true
-            }
-
-            Msg::UpdateInputChatValue(val) => {
-                self.chat_value = val;
-
-                true
-            }
-
-            Msg::ValidateOffer => {
-                let state = self.web_rtc_manager.borrow().get_state();
-
-                match state {
-                    State::Server(_connection_state) => {
-                        let result = T::validate_answer(self.web_rtc_manager.clone(), &self.value);
-
-                        if result.is_err() {
-                            web_sys::Window::alert_with_message(
-                                &web_sys::window().unwrap(),
-                                &format!(
-                                    "Cannot use answer. Failure reason: {:?}",
-                                    result.err().unwrap()
-                                ),
-                            )
-                            .expect("alert should work");
-                        }
-                    }
-                    _ => {
-                        let result = T::validate_offer(self.web_rtc_manager.clone(), &self.value);
-
-                        if result.is_err() {
-                            web_sys::Window::alert_with_message(
-                                &web_sys::window().unwrap(),
-                                &format!(
-                                    "Cannot use offer. Failure reason: {:?}",
-                                    result.err().unwrap()
-                                ),
-                            )
-                            .expect("alert should work");
-                        }
-                    }
-                };
-
-                true
-            }
-
-            Msg::NewMessage(message) => {
-                self.messages.push(message);
-                self.scroll_top();
-
-                true
-            }
-
-            Msg::Send => {
-                let my_message = Message::new(self.chat_value.clone(), MessageSender::Me);
-                self.messages.push(my_message);
-                self.web_rtc_manager.borrow().send_message(&self.chat_value);
-                self.chat_value = "".into();
-                self.scroll_top();
-
-                true
-            }
-
-            Msg::Disconnect => {
-                self.web_rtc_manager = T::new(ctx.link()).expect("Failed to create WebRTC manager");
-                self.messages = vec![];
-                self.chat_value = "".into();
-                self.value = "".into();
-
-                true
-            }
-
-            Msg::OnKeyUp(event) => {
-                if event.key_code() == 13 && !self.chat_value.is_empty() {
-                    let my_message = Message::new(self.chat_value.clone(), MessageSender::Me);
-                    self.messages.push(my_message);
-                    self.web_rtc_manager.borrow().send_message(&self.chat_value);
-                    self.chat_value = "".into();
-                    self.scroll_top();
-                }
-
-                true
-            }
-
-            Msg::CopyToClipboard => {
-                self.copy_content_to_clipboard();
-
-                true
-            }
+            ChatModelMessage::ResetWebRTC => self.reset_webrtc(ctx),
+            ChatModelMessage::UpdateTextInput(val) => self.update_text_input(val),
+            ChatModelMessage::ValidateOffer => self.validate_offer(),
+            ChatModelMessage::NewMessage(message) => self.new_message(message),
+            ChatModelMessage::SendMessage => self.send_message(),
+            ChatModelMessage::Disconnect => self.disconnect(ctx),
+            ChatModelMessage::OnKeyUp(event) => self.on_key_up(event),
+            ChatModelMessage::CopyToClipboard => self.copy_to_clipboard(),
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let content = match &self.web_rtc_manager.borrow().get_state() {
-            State::Default => {
-                html! {
-                    <>
-                        { self.get_chat_header(ctx) }
-
-                        <main class="flex flex-row justify-center items-center h-screen" ref={self.node_ref.clone()}>
-                            <div class="flex flex-row items-center space-x-2">
-                                <button
-                                    class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
-                                    onclick={ctx.link().callback(move |_| Msg::StartAsServer)}>
-                                    {"Start a new conversation"}
-                                </button>
-                                <span class="mx-2">{" or "}</span>
-                                <button
-                                    class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
-                                    onclick={ctx.link().callback(move |_| Msg::ConnectToServer)}>
-                                    {"Join a conversation"}
-                                </button>
-                            </div>
-                        </main>
-
-                        { self.get_input_for_chat_message(ctx) }
-                    </>
-                }
-            }
-
-            State::Server(connection_state) => {
-                html! {
-                    <>
-                        { self.get_chat_header(ctx) }
-
-                        <main class="flex flex-col h-screen" ref={self.node_ref.clone()}>
-                            {
-                                if connection_state.data_channel_state.is_some() &&
-                                   connection_state.data_channel_state.unwrap() == RtcDataChannelState::Open
-                                {
-                                    html! {
-                                        <div class="flex-grow overflow-y-auto p-4">
-                                            { self.get_messages_as_html() }
-                                        </div>
-                                    }
-                                } else if connection_state.ice_gathering_state.is_some() {
-                                    html! {
-                                        <div class="flex-grow p-4">
-                                            <div class="mb-4">
-                                                { self.get_offer_and_candidates(ctx) }
-                                            </div>
-                                            <div>
-                                                { "Enter off response here:" }
-                                                { self.get_validate_offer_or_answer(ctx) }
-                                            </div>
-                                        </div>
-                                    }
-                                } else {
-                                    html! {}
-                                }
-                            }
-                            { self.get_input_for_chat_message(ctx) }
-                        </main>
-                    </>
-                }
-            }
-
-            State::Client(connection_state) => {
-                html! {
-                    <>
-                        { self.get_chat_header(ctx) }
-
-                        <main class="flex flex-col h-screen" ref={self.node_ref.clone()}>
-                            {
-                                if connection_state.data_channel_state.is_some() &&
-                                   connection_state.data_channel_state.unwrap() == RtcDataChannelState::Open
-                                {
-                                    html! {
-                                        <div class="flex-grow overflow-y-auto p-4">
-                                            { self.get_messages_as_html() }
-                                        </div>
-                                    }
-                                } else if connection_state.ice_gathering_state.is_some() {
-                                    html! {
-                                        <div class="flex-grow p-4">
-                                            <div class="mb-4">
-                                                { self.get_offer_and_candidates(ctx) }
-                                            </div>
-                                        </div>
-                                    }
-                                } else {
-                                    html! {
-                                        <div class="flex-grow p-4">
-                                            { "Enter join token" }
-                                            { self.get_validate_offer_or_answer(ctx) }
-                                            <p class="mt-2 text-sm text-gray-600">
-                                                { "If after a while the connection cannot be established, it is probably because there is a network issue between the 2 computers." }
-                                            </p>
-                                        </div>
-                                    }
-                                }
-                            }
-                            { self.get_input_for_chat_message(ctx) }
-                        </main>
-                    </>
-                }
-            }
-        };
-
         html! {
             <div class="h-full">
-                { content }
+                { self.get_chat_header(ctx) }
+                { self.get_content(ctx) }
             </div>
         }
     }
 }
 
 impl<T: NetworkManager + 'static> ChatModel<T> {
+    fn start_as_server(&mut self) -> bool {
+        self.web_rtc_manager
+            .borrow_mut()
+            .set_state(State::Server(ConnectionState::new()));
+        T::start_web_rtc(self.web_rtc_manager.clone()).expect("Failed to start WebRTC manager");
+        true
+    }
+
+    fn connect_to_server(&mut self) -> bool {
+        self.web_rtc_manager
+            .borrow_mut()
+            .set_state(State::Client(ConnectionState::new()));
+        T::start_web_rtc(self.web_rtc_manager.clone()).expect("Failed to start WebRTC manager");
+        true
+    }
+
+    fn update_webrtc_state(&mut self, web_rtc_state: State) -> bool {
+        self.text_input.clear();
+        let debug = get_debug_state_string(&web_rtc_state);
+        console::log_1(&debug.into());
+        true
+    }
+
+    fn reset_webrtc(&mut self, ctx: &Context<Self>) -> bool {
+        self.web_rtc_manager =
+            T::new(create_message_callback(ctx)).expect("Failed to create WebRTC manager");
+        self.messages.clear();
+        self.text_input.clear();
+        true
+    }
+
+    fn update_text_input(&mut self, val: String) -> bool {
+        self.text_input = val;
+        true
+    }
+
+    fn validate_offer(&self) -> bool {
+        let state = self.web_rtc_manager.borrow().get_state();
+        let result = match state {
+            State::Server(_) => T::validate_answer(self.web_rtc_manager.clone(), &self.text_input),
+            _ => T::validate_offer(self.web_rtc_manager.clone(), &self.text_input),
+        };
+
+        if let Err(err) = result {
+            web_sys::Window::alert_with_message(
+                &web_sys::window().unwrap(),
+                &format!("Cannot use offer. Failure reason: {:?}", err),
+            )
+            .expect("alert should work");
+        }
+        true
+    }
+
+    fn new_message(&mut self, message: Message) -> bool {
+        self.messages.push(message);
+        self.scroll_top();
+        true
+    }
+
+    fn send_message(&mut self) -> bool {
+        let my_message = Message::new(self.text_input.clone(), MessageSender::Me);
+        self.messages.push(my_message);
+        self.web_rtc_manager.borrow().send_message(&self.text_input);
+        self.text_input.clear();
+        self.scroll_top();
+        true
+    }
+
+    fn disconnect(&mut self, ctx: &Context<Self>) -> bool {
+        self.web_rtc_manager =
+            T::new(create_message_callback(ctx)).expect("Failed to create WebRTC manager");
+        self.messages.clear();
+        self.text_input.clear();
+        true
+    }
+
+    fn on_key_up(&mut self, event: KeyboardEvent) -> bool {
+        if event.key_code() == 13 && !self.text_input.is_empty() {
+            let my_message = Message::new(self.text_input.clone(), MessageSender::Me);
+            self.messages.push(my_message);
+            self.web_rtc_manager.borrow().send_message(&self.text_input);
+            self.text_input.clear();
+            self.scroll_top();
+        }
+        true
+    }
+
+    fn copy_to_clipboard(&self) -> bool {
+        self.copy_content_to_clipboard();
+        true
+    }
+
     fn scroll_top(&self) {
         let node_ref = self.node_ref.clone();
-
         spawn_local(async move {
-            let chat_main = node_ref.cast::<Element>().unwrap();
-            let current_scroll_top = chat_main.scroll_top();
-            chat_main.set_scroll_top(current_scroll_top + 100000000);
-        })
+            if let Some(chat_main) = node_ref.cast::<Element>() {
+                let current_scroll_top = chat_main.scroll_top();
+                chat_main.set_scroll_top(current_scroll_top + 100000000);
+            }
+        });
     }
 
     fn get_chat_header(&self, ctx: &Context<Self>) -> Html {
@@ -353,7 +217,7 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
                             html! {
                                 <button
                                     class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg transition-colors"
-                                    onclick={ctx.link().callback(move |_| Msg::Disconnect)}>
+                                    onclick={ctx.link().callback(move |_| ChatModelMessage::Disconnect)}>
                                     {"Disconnect"}
                                 </button>
                             }
@@ -369,20 +233,17 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
     fn is_chat_enabled(&self) -> bool {
         match &self.web_rtc_manager.borrow().get_state() {
             State::Default => false,
-            State::Server(connection_state) => {
-                connection_state.data_channel_state.is_some()
-                    && connection_state.data_channel_state.unwrap() == RtcDataChannelState::Open
-            }
-            State::Client(connection_state) => {
-                connection_state.data_channel_state.is_some()
-                    && connection_state.data_channel_state.unwrap() == RtcDataChannelState::Open
+            State::Server(connection_state) | State::Client(connection_state) => {
+                connection_state.data_channel_state == Some(RtcDataChannelState::Open)
             }
         }
     }
 
     fn get_input_for_chat_message(&self, ctx: &Context<Self>) -> Html {
-        let is_chat_enabled = self.is_chat_enabled();
-        let is_send_button_enabled = is_chat_enabled && !self.chat_value.is_empty();
+        if !self.is_chat_enabled() {
+            return html! {};
+        }
+        let is_send_button_enabled = !self.text_input.is_empty();
         let button_class = if is_send_button_enabled {
             "bg-blue-500 hover:bg-blue-600 text-white"
         } else {
@@ -395,17 +256,16 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
                     <input
                         type="text"
                         class="flex-grow p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        disabled={!is_chat_enabled}
-                        placeholder={if is_chat_enabled { "Type a message..." } else { "Waiting for connection..." }}
+                        placeholder={"Type a message..."}
                         id="chat-message-box"
-                        value={self.chat_value.clone()}
-                        oninput={ctx.link().callback(|e: InputEvent| {Msg::UpdateInputChatValue(e.target_unchecked_into::<HtmlInputElement>().value())})}
-                        onkeyup={ctx.link().callback(move |e: KeyboardEvent| Msg::OnKeyUp(e))}
+                        value={self.text_input.clone()}
+                        oninput={ctx.link().callback(|e: InputEvent| {ChatModelMessage::UpdateTextInput(e.target_unchecked_into::<HtmlInputElement>().value())})}
+                        onkeyup={ctx.link().callback(move |e: KeyboardEvent| ChatModelMessage::OnKeyUp(e))}
                     />
                     <button
                         class={format!("{} font-medium py-3 px-6 rounded-lg transition-colors", button_class)}
                         disabled={!is_send_button_enabled}
-                        onclick={ctx.link().callback(move |_| Msg::Send)}
+                        onclick={ctx.link().callback(move |_| ChatModelMessage::SendMessage)}
                     >
                         {"Send"}
                     </button>
@@ -419,14 +279,14 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
             <div class="space-y-3">
                 <textarea
                     class="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none min-h-[100px]"
-                    value={self.value.clone()}
-                    oninput={ctx.link().callback(|e: InputEvent| {Msg::UpdateInputValue(e.target_unchecked_into::<HtmlInputElement>().value())})}
+                    value={self.text_input.clone()}
+                    oninput={ctx.link().callback(|e: InputEvent| {ChatModelMessage::UpdateTextInput(e.target_unchecked_into::<HtmlInputElement>().value())})}
                     placeholder="Paste the connection code here"
                 >
                 </textarea>
                 <button
                     class="w-full bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg transition-colors"
-                    onclick={ctx.link().callback(move |_| Msg::ValidateOffer)}
+                    onclick={ctx.link().callback(move |_| ChatModelMessage::ValidateOffer)}
                 >
                     {"Connect"}
                 </button>
@@ -445,7 +305,6 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
         };
 
         let serialized: String = serde_json::to_string(&connection_string).unwrap();
-
         BASE64_STANDARD.encode(serialized)
     }
 
@@ -460,7 +319,7 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
                     <div class="break-all text-sm font-mono mb-3" id="copy-elem">{encoded}</div>
                     <button
                         class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-2 px-4 rounded-lg transition-colors flex items-center gap-2"
-                        onclick={ctx.link().callback(move |_| Msg::CopyToClipboard)}
+                        onclick={ctx.link().callback(move |_| ChatModelMessage::CopyToClipboard)}
                     >
                         {"Copy to clipboard"}
                     </button>
@@ -471,25 +330,10 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
 
     fn get_debug_html(&self) -> Html {
         let state = self.web_rtc_manager.borrow().get_state();
-
-        match state {
-            State::Default => html! { <div> { "|Default State|"} </div> },
-            State::Server(connection_state) => html! {
-                <div>
-                    { "|Server|"}
-                    { " |ice_gathering: "} { format!("{:?}|", connection_state.ice_gathering_state) }
-                    { " |ice_connection: "} { format!("{:?}|", connection_state.ice_connection_state) }
-                    { " |data_channel: "} { format!("{:?}|", connection_state.data_channel_state) }
-                </div>
-            },
-            State::Client(connection_state) => html! {
-                <div>
-                    { "|Client|"}
-                    { " |ice_gathering: "} { format!("{:?}|", connection_state.ice_gathering_state) }
-                    { " |ice_connection: "} { format!("{:?}|", connection_state.ice_connection_state) }
-                    { " |data_channel: "} { format!("{:?}|", connection_state.data_channel_state) }
-                </div>
-            },
+        html! {
+            <div>
+                { format!("{:?}", state) }
+            </div>
         }
     }
 
@@ -502,6 +346,7 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
             .get_element_by_id("copy-elem")
             .unwrap()
             .inner_html();
+
         let _result = aux.set_attribute("value", &content);
         let document = window.document().unwrap();
         let _result = document.body().unwrap().append_child(&aux);
@@ -516,8 +361,7 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
         html! {
             <ul class="space-y-4 px-4">
                 {
-                    for self.messages.iter().map(|a_message|
-                    {
+                    for self.messages.iter().map(|a_message| {
                         let (message_class, align_class) = if a_message.sender == MessageSender::Other {
                             ("bg-gray-100 text-gray-800", "self-start")
                         } else {
@@ -540,6 +384,113 @@ impl<T: NetworkManager + 'static> ChatModel<T> {
             </ul>
         }
     }
+
+    fn get_content(&self, ctx: &Context<Self>) -> Html {
+        match &self.web_rtc_manager.borrow().get_state() {
+            State::Default => self.get_default_content(ctx),
+            State::Server(connection_state) => self.get_server_content(ctx, connection_state),
+            State::Client(connection_state) => self.get_client_content(ctx, connection_state),
+        }
+    }
+
+    fn get_default_content(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <main class="flex flex-row justify-center items-center h-screen" ref={self.node_ref.clone()}>
+                <div class="flex flex-row items-center space-x-2">
+                    <button
+                        class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                        onclick={ctx.link().callback(move |_| ChatModelMessage::StartAsServer)}>
+                        {"Start a new conversation"}
+                    </button>
+                    <span class="mx-2">{" or "}</span>
+                    <button
+                        class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                        onclick={ctx.link().callback(move |_| ChatModelMessage::ConnectToServer)}>
+                        {"Join a conversation"}
+                    </button>
+                </div>
+            </main>
+        }
+    }
+
+    fn get_server_content(&self, ctx: &Context<Self>, connection_state: &ConnectionState) -> Html {
+        html! {
+            <>
+                { self.get_input_for_chat_message(ctx) }
+                <main class="flex flex-col h-screen" ref={self.node_ref.clone()}>
+                    {
+                        if connection_state.data_channel_state == Some(RtcDataChannelState::Open) {
+                            html! {
+                                <div class="flex-grow overflow-y-auto p-4">
+                                    { self.get_messages_as_html() }
+                                </div>
+                            }
+                        } else if connection_state.ice_gathering_state.is_some() {
+                            html! {
+                                <div class="flex-grow p-4">
+                                    <div class="mb-4">
+                                        { self.get_offer_and_candidates(ctx) }
+                                    </div>
+                                    <div>
+                                        { "Enter off response here:" }
+                                        { self.get_validate_offer_or_answer(ctx) }
+                                    </div>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
+                </main>
+            </>
+        }
+    }
+
+    fn get_client_content(&self, ctx: &Context<Self>, connection_state: &ConnectionState) -> Html {
+        html! {
+            <>
+                { self.get_input_for_chat_message(ctx) }
+                <main class="flex flex-col h-screen" ref={self.node_ref.clone()}>
+                    {
+                        if connection_state.data_channel_state == Some(RtcDataChannelState::Open) {
+                            html! {
+                                <div class="flex-grow overflow-y-auto p-4">
+                                    { self.get_messages_as_html() }
+                                </div>
+                            }
+                        } else if connection_state.ice_gathering_state.is_some() {
+                            html! {
+                                <div class="flex-grow p-4">
+                                    <div class="mb-4">
+                                        { self.get_offer_and_candidates(ctx) }
+                                    </div>
+                                </div>
+                            }
+                        } else {
+                            html! {
+                                <div class="flex-grow p-4">
+                                    { "Enter join token" }
+                                    { self.get_validate_offer_or_answer(ctx) }
+                                    <p class="mt-2 text-sm text-gray-600">
+                                        { "If after a while the connection cannot be established, it is probably because there is a network issue between the 2 computers." }
+                                    </p>
+                                </div>
+                            }
+                        }
+                    }
+                </main>
+            </>
+        }
+    }
+}
+
+fn create_message_callback(
+    ctx: &Context<ChatModel<impl NetworkManager + 'static>>,
+) -> Rc<dyn Fn(ChatModelMessage)> {
+    let link = ctx.link().clone();
+    Rc::new(move |msg: ChatModelMessage| {
+        link.send_message(msg);
+    })
 }
 
 fn get_debug_state_string(state: &State) -> String {
@@ -552,7 +503,6 @@ fn get_debug_state_string(state: &State) -> String {
             connection_state.ice_connection_state,
             connection_state.data_channel_state,
         ),
-
         State::Client(connection_state) => format!(
             "{}\nice gathering: {:?}\nice connection: {:?}\ndata channel: {:?}\n",
             "Client",
