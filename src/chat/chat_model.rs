@@ -18,10 +18,10 @@ pub enum MessageSender {
     Other,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Message {
-    sender: MessageSender,
-    content: String,
+    pub sender: MessageSender,
+    pub content: String,
 }
 
 impl Message {

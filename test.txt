@@ -1,0 +1,50 @@
+use yew::{function_component, html, use_state, use_effect, Callback, Properties};
+use wasm_bindgen_futures::spawn_local;
+use crate::external::{FetchService, JokeService, Joke}; // Import the required types
+
+#[derive(Properties, PartialEq)]
+pub struct ServiceProps<S>
+where
+    S: FetchService + 'static,
+{
+    pub service: S,
+}
+
+#[function_component(GenericFetcher)]
+pub fn generic_fetcher<S>(props: &ServiceProps<S>) -> Html
+where
+    S: FetchService + 'static,
+{
+    // Create state hooks for the joke and loading states
+    let joke = use_state(|| String::from("Waiting for joke..."));
+    let is_loading = use_state(|| false);
+
+    // use_effect to subscribe to the joke stream when the component mounts
+    use_effect(move || {
+        let mut service = props.service.clone();
+        
+        // This simulates continuous joke updates
+        spawn_local(async move {
+            let mut stream = service.stream(); // assuming stream method for JokeService
+            
+            // Continuously receive jokes from the message bus
+            while let Some(new_joke) = stream.next().await {
+                joke.set(format!("{} - {}", new_joke.setup, new_joke.punchline));
+            }
+        });
+
+        // Cleanup function (for unsubscription or closing the stream)
+        || {}
+    }, ());
+
+    html! {
+        <div>
+            <p>{ (*joke).clone() }</p>
+            {
+                if *is_loading {
+                    html! { <p>{ "Loading joke..." }</p> }
+                }
+            }
+        </div>
+    }
+}

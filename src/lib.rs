@@ -1,6 +1,7 @@
 #![recursion_limit = "128000"]
 mod chat_component;
 mod chat_service;
+mod message_list;
 use chat_component::ChatComponent;
 use chat_service::WebRTCChatService;
 use wasm_bindgen::prelude::*;
@@ -10,10 +11,10 @@ mod chat;
 
 #[function_component(App)]
 fn app() -> Html {
-    let joke_service = WebRTCChatService::new("stun:stun.l.google.com:19302");
+    let chat_service = WebRTCChatService::new("stun:stun.l.google.com:19302");
 
     html! {
-        <ChatComponent<WebRTCChatService> service={joke_service} />
+        <ChatComponent<WebRTCChatService> service={chat_service} />
     }
 }
 
