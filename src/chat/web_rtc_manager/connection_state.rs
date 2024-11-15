@@ -7,8 +7,9 @@ pub struct ConnectionState {
     pub data_channel_state: Option<RtcDataChannelState>,
 }
 
-#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+#[derive(PartialEq, Eq, Clone, Debug, Copy, Default)]
 pub enum State {
+    #[default]
     Default,
     Server(ConnectionState),
     Client(ConnectionState),

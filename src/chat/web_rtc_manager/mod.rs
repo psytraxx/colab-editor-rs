@@ -1,4 +1,4 @@
-mod config;
+pub mod config;
 pub mod connection_state;
 mod error;
 use super::chat_model::{ChatModelMessage, ConnectionString, Message, MessageSender};
@@ -26,9 +26,9 @@ type MessageCallback = Rc<dyn Fn(ChatModelMessage)>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IceCandidate {
-    candidate: String,
-    sdp_mid: String,
-    sdp_m_line_index: u16,
+    pub candidate: String,
+    pub sdp_mid: String,
+    pub sdp_m_line_index: u16,
 }
 
 pub trait NetworkManager {

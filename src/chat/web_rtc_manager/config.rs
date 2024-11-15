@@ -1,7 +1,8 @@
 use web_sys::RtcConfiguration;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct RTCConfig {
-    stun_server: String,
+    pub stun_server: String,
 }
 
 impl Default for RTCConfig {
