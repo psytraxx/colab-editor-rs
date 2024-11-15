@@ -24,7 +24,7 @@ type SingleArgClosure = Closure<dyn FnMut(JsValue)>;
 type SingleArgJsFn = Box<dyn FnMut(JsValue)>;
 type MessageCallback = Rc<dyn Fn(ChatModelMessage)>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IceCandidate {
     candidate: String,
     sdp_mid: String,
@@ -81,7 +81,7 @@ impl NetworkManager for WebRTCManager {
     }
 
     fn get_state(&self) -> State {
-        self.state.clone()
+        self.state
     }
 
     fn set_state(&mut self, new_state: State) {
@@ -273,7 +273,7 @@ impl NetworkManager for WebRTCManager {
             "create_offer closure has encountered an exception".into(),
         );
 
-        let state = web_rtc_manager.borrow().state.clone();
+        let state = web_rtc_manager.borrow().state;
 
         match state {
             State::Server(_connection_state) => {

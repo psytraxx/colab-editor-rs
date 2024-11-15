@@ -1,13 +1,13 @@
 use web_sys::{RtcDataChannelState, RtcIceConnectionState, RtcIceGatheringState};
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
 pub struct ConnectionState {
     pub ice_gathering_state: Option<RtcIceGatheringState>,
     pub ice_connection_state: Option<RtcIceConnectionState>,
     pub data_channel_state: Option<RtcDataChannelState>,
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
 pub enum State {
     Default,
     Server(ConnectionState),
