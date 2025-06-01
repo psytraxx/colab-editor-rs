@@ -17,7 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22.1"
 wasm-bindgen-futures = "0.4.45"
-hmac-sha256 = "0.1.2"
+hmac-sha256 = "1.0.0"
 hex = "0.4.2"
 thiserror = "2.0.3"
 
