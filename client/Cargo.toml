@@ -16,4 +16,4 @@ wasm-bindgen-futures = "0.4"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 common = { path = "../common" }
 js-sys = "0.3"
-web-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
