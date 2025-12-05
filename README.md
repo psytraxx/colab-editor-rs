@@ -1,6 +1,6 @@
 git-u# WebRTC Collaborative Editor (Rust + WASM)
 
-A **serverless peer-to-peer collaborative text editor** built with Rust, WebAssembly, Automerge CRDT, and WebRTC.
+A **serverless peer-to-peer collaborative text editor** built with Rust, WebAssembly, Automerge CRDT, and WebRTC. https://psytraxx.github.io/colab-editor-rs/
 
 ## 🚀 Features
 
