@@ -54,7 +54,7 @@ async fn main() {
         let mut doc = AutoCommit::new();
         doc.put(automerge::ROOT, common::DOC_KEY_TITLE, "Untitled").unwrap();
         doc.put(automerge::ROOT, common::DOC_KEY_BODY, "").unwrap();
-        doc.put(automerge::ROOT, common::DOC_KEY_DESCRIPTION, "").unwrap();
+        doc.put(automerge::ROOT, common::DOC_KEY_KEYWORDS, "").unwrap();
         doc.put(automerge::ROOT, common::DOC_KEY_VERSION, 0u64).unwrap();
         doc
     };

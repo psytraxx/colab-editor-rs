@@ -16,11 +16,11 @@ pub struct UserState {
     pub user_id: String,
     pub user_name: String,
     pub editing: bool,           // true if in edit mode
-    pub field: Option<String>,   // which field they're focused on: "title", "description", "body"
+    pub field: Option<String>,   // which field they're focused on: "title", "keywords", "body"
     pub online: bool,            // false when disconnecting
 }
 
 pub const DOC_KEY_TITLE: &str = "title";
 pub const DOC_KEY_BODY: &str = "body";
-pub const DOC_KEY_DESCRIPTION: &str = "description";
+pub const DOC_KEY_KEYWORDS: &str = "keywords";
 pub const DOC_KEY_VERSION: &str = "version";

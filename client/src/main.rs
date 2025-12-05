@@ -3,7 +3,7 @@ use automerge::{
     transaction::Transactable,
     AutoCommit, ReadDoc,
 };
-use common::{WsMessage, UserState, DOC_KEY_BODY, DOC_KEY_DESCRIPTION, DOC_KEY_TITLE, DOC_KEY_VERSION};
+use common::{WsMessage, UserState, DOC_KEY_BODY, DOC_KEY_KEYWORDS, DOC_KEY_TITLE, DOC_KEY_VERSION};
 use futures::{channel::mpsc::Sender, SinkExt, StreamExt};
 use gloo::net::websocket::{futures::WebSocket, Message};
 use web_sys::console::log_1;
@@ -259,7 +259,7 @@ impl Component for App {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let title = self.get_str(DOC_KEY_TITLE);
-        let description = self.get_str(DOC_KEY_DESCRIPTION);
+        let keywords = self.get_str(DOC_KEY_KEYWORDS);
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
 
@@ -268,8 +268,8 @@ impl Component for App {
         let title_editors: Vec<_> = self.users.values()
             .filter(|u| u.editing && u.field.as_deref() == Some("title") && Some(u.user_id.as_str()) != my_id)
             .collect();
-        let description_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("description") && Some(u.user_id.as_str()) != my_id)
+        let keywords_editors: Vec<_> = self.users.values()
+            .filter(|u| u.editing && u.field.as_deref() == Some("keywords") && Some(u.user_id.as_str()) != my_id)
             .collect();
         let body_editors: Vec<_> = self.users.values()
             .filter(|u| u.editing && u.field.as_deref() == Some("body") && Some(u.user_id.as_str()) != my_id)
@@ -303,7 +303,7 @@ impl Component for App {
                     <div class="view-mode">
                         <span class="mode-badge mode-view">{"VIEW MODE"}</span>
                         <h2>{ title }</h2>
-                        <p style="font-style: italic;">{ description }</p>
+                        <p style="font-style: italic;">{ keywords }</p>
                         <hr/>
                         <div class="body-content">{Html::from_html_unchecked(body.into())}</div>
                     </div>
@@ -312,21 +312,21 @@ impl Component for App {
                         <span class="mode-badge mode-edit">{"EDIT MODE (CRDT Active)"}</span>
                         
                         <div class="field field-with-cursors">
-                            <label>{ "Title" }</label>
+                            <label>{ "Keywords" }</label>
                             <div class="input-wrapper">
                                 <input 
-                                    key="title"
+                                    key="keywords"
                                     type="text" 
-                                    value={title} 
+                                    value={keywords}
                                     oninput={ctx.link().callback(|e: InputEvent| {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdateField(DOC_KEY_TITLE, input.value())
+                                        Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
                                     })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string())))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))
                                 />
                                 <div class="cursors">
-                                { for title_editors.iter().map(|user| {
+                                { for keywords_editors.iter().map(|user| {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
@@ -341,21 +341,21 @@ impl Component for App {
                         </div>
 
                         <div class="field field-with-cursors">
-                            <label>{ "Description" }</label>
+                            <label>{ "Keywords" }</label>
                             <div class="input-wrapper">
                                 <input 
-                                    key="description"
+                                    key="keywords"
                                     type="text" 
-                                    value={description}
+                                    value={keywords}
                                     oninput={ctx.link().callback(|e: InputEvent| {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdateField(DOC_KEY_DESCRIPTION, input.value())
+                                        Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
                                     })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("description".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string())))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
                                 />
                                 <div class="cursors">
-                                { for description_editors.iter().map(|user| {
+                                { for keywords_editors.iter().map(|user| {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
