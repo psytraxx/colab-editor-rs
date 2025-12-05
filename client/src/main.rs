@@ -335,15 +335,16 @@ impl Component for App {
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
 
-        // Get users editing each field
+        // Get OTHER users editing each field (exclude self)
+        let my_id = self.my_id.as_deref();
         let title_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("title"))
+            .filter(|u| u.editing && u.field.as_deref() == Some("title") && Some(u.user_id.as_str()) != my_id)
             .collect();
         let description_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("description"))
+            .filter(|u| u.editing && u.field.as_deref() == Some("description") && Some(u.user_id.as_str()) != my_id)
             .collect();
         let body_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("body"))
+            .filter(|u| u.editing && u.field.as_deref() == Some("body") && Some(u.user_id.as_str()) != my_id)
             .collect();
 
         html! {
