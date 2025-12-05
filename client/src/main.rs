@@ -124,64 +124,14 @@ impl Component for App {
             }
             Msg::WsMessage(ws_msg) => {
                 match ws_msg {
-                    WsMessage::Sync(binary) => {
-                        if let Ok(sync_msg) = sync::Message::decode(&binary) {
-                            let heads_before = self.doc.get_heads();
-                            self.doc.sync().receive_sync_message(&mut self.sync_state, sync_msg).unwrap();
-                            let heads_after = self.doc.get_heads();
-                            
-                            // Update TinyMCE if body changed from remote and we're in edit mode
-                            if heads_before != heads_after && self.tinymce_initialized {
-                                if let Some(editor) = get("body-editor") {
-                                    let new_body = self.get_str(DOC_KEY_BODY);
-                                    let current_content = editor.get_content();
-                                    if new_body != current_content {
-                                        editor.set_content(&new_body);
-                                    }
-                                }
-                            }
-                            
-                            ctx.link().send_message(Msg::SendSync);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    WsMessage::UserState(user_state) => {
-                        log_1(&format!(
-                            "[CLIENT] Received UserState: id={} name={} editing={} field={:?} online={}",
-                            user_state.user_id, user_state.user_name, user_state.editing, 
-                            user_state.field, user_state.online
-                        ).into());
-                        
-                        // Capture our own identity from the first message about ourselves
-                        if self.my_id.is_none() {
-                            self.my_id = Some(user_state.user_id.clone());
-                            self.my_name = Some(user_state.user_name.clone());
-                            log_1(&format!("[CLIENT] My identity: {} ({})", user_state.user_name, user_state.user_id).into());
-                        }
-                        
-                        // Don't overwrite our own state from server - we manage it locally
-                        let dominated_by_local = self.my_id.as_ref() == Some(&user_state.user_id);
-                        
-                        if user_state.online {
-                            if dominated_by_local {
-                                // Only update our entry if we don't have one yet
-                                self.users.entry(user_state.user_id.clone()).or_insert(user_state);
-                            } else {
-                                self.users.insert(user_state.user_id.clone(), user_state);
-                            }
-                        } else {
-                            self.users.remove(&user_state.user_id);
-                        }
-                        
-                        log_1(&format!(
-                            "[CLIENT] Total users in map: {}",
-                            self.users.len()
-                        ).into());
-                        
+                    WsMessage::Welcome(id) => {
+                        self.my_id = Some(id.clone());
+                        self.my_name = Some(id.clone());
+                        log_1(&format!("[CLIENT] Welcome! My identity: {}", id).into());
                         true
                     }
+                    WsMessage::Sync(binary) => self.handle_sync(ctx, binary),
+                    WsMessage::UserState(user_state) => self.handle_user_state(user_state),
                 }
             }
             Msg::UpdateField(key, value) => {
@@ -230,52 +180,7 @@ impl Component for App {
                 true
             }
             Msg::InitTinyMCE => {
-                if !self.tinymce_initialized {
-                    let link = ctx.link().clone();
-                    let body_content = self.get_str(DOC_KEY_BODY);
-                    
-                    // Delay initialization to ensure DOM is ready
-                    spawn_local(async move {
-                        gloo_timers::future::TimeoutFuture::new(50).await;
-                        
-                        let options = js_sys::Object::new();
-                        js_sys::Reflect::set(&options, &"selector".into(), &"#body-editor".into()).unwrap();
-                        js_sys::Reflect::set(&options, &"inline".into(), &true.into()).unwrap();
-                        js_sys::Reflect::set(&options, &"menubar".into(), &false.into()).unwrap();
-                        js_sys::Reflect::set(&options, &"plugins".into(), &"lists link code".into()).unwrap();
-                        js_sys::Reflect::set(&options, &"toolbar".into(), &"undo redo | bold italic underline | bullist numlist | link code".into()).unwrap();
-                        js_sys::Reflect::set(&options, &"license_key".into(), &"gpl".into()).unwrap();
-                        
-                        // Setup callback for changes
-                        let link_clone = link.clone();
-                        let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
-                            let link_inner = link_clone.clone();
-                            let on_change = Closure::wrap(Box::new(move || {
-                                link_inner.send_message(Msg::SyncBodyFromTinyMCE);
-                            }) as Box<dyn Fn()>);
-                            
-                            // Register change and keyup events
-                            let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
-                            let on_fn = on_method.unchecked_into::<js_sys::Function>();
-                            let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
-                            let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
-                            on_change.forget();
-                        }) as Box<dyn Fn(JsValue)>);
-                        
-                        js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
-                        setup_fn.forget();
-                        
-                        init(&options.into());
-                        
-                        // Set initial content after a brief delay
-                        gloo_timers::future::TimeoutFuture::new(100).await;
-                        if let Some(editor) = get("body-editor") {
-                            editor.set_content(&body_content);
-                        }
-                    });
-                    
-                    self.tinymce_initialized = true;
-                }
+                self.init_tinymce(ctx);
                 false
             }
             Msg::SyncBodyFromTinyMCE => {
@@ -514,6 +419,108 @@ impl App {
                 _ => 0,
             })
             .unwrap_or(0)
+    }
+
+    fn handle_sync(&mut self, ctx: &Context<Self>, binary: Vec<u8>) -> bool {
+        if let Ok(sync_msg) = sync::Message::decode(&binary) {
+            let heads_before = self.doc.get_heads();
+            self.doc.sync().receive_sync_message(&mut self.sync_state, sync_msg).unwrap();
+            let heads_after = self.doc.get_heads();
+            
+            // Update TinyMCE if body changed from remote and we're in edit mode
+            if heads_before != heads_after && self.tinymce_initialized {
+                if let Some(editor) = get("body-editor") {
+                    let new_body = self.get_str(DOC_KEY_BODY);
+                    let current_content = editor.get_content();
+                    if new_body != current_content {
+                        editor.set_content(&new_body);
+                    }
+                }
+            }
+            
+            ctx.link().send_message(Msg::SendSync);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn handle_user_state(&mut self, user_state: UserState) -> bool {
+        log_1(&format!(
+            "[CLIENT] Received UserState: id={} name={} editing={} field={:?} online={}",
+            user_state.user_id, user_state.user_name, user_state.editing, 
+            user_state.field, user_state.online
+        ).into());
+        
+        // Don't overwrite our own state from server - we manage it locally
+        let dominated_by_local = self.my_id.as_ref() == Some(&user_state.user_id);
+        
+        if user_state.online {
+            if dominated_by_local {
+                // Only update our entry if we don't have one yet
+                self.users.entry(user_state.user_id.clone()).or_insert(user_state);
+            } else {
+                self.users.insert(user_state.user_id.clone(), user_state);
+            }
+        } else {
+            self.users.remove(&user_state.user_id);
+        }
+        
+        log_1(&format!(
+            "[CLIENT] Total users in map: {}",
+            self.users.len()
+        ).into());
+        
+        true
+    }
+
+    fn init_tinymce(&mut self, ctx: &Context<Self>) {
+        if !self.tinymce_initialized {
+            let link = ctx.link().clone();
+            let body_content = self.get_str(DOC_KEY_BODY);
+            
+            // Delay initialization to ensure DOM is ready
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(50).await;
+                
+                let options = js_sys::Object::new();
+                js_sys::Reflect::set(&options, &"selector".into(), &"#body-editor".into()).unwrap();
+                js_sys::Reflect::set(&options, &"inline".into(), &true.into()).unwrap();
+                js_sys::Reflect::set(&options, &"menubar".into(), &false.into()).unwrap();
+                js_sys::Reflect::set(&options, &"plugins".into(), &"lists link code".into()).unwrap();
+                js_sys::Reflect::set(&options, &"toolbar".into(), &"undo redo | bold italic underline | bullist numlist | link code".into()).unwrap();
+                js_sys::Reflect::set(&options, &"license_key".into(), &"gpl".into()).unwrap();
+                
+                // Setup callback for changes
+                let link_clone = link.clone();
+                let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
+                    let link_inner = link_clone.clone();
+                    let on_change = Closure::wrap(Box::new(move || {
+                        link_inner.send_message(Msg::SyncBodyFromTinyMCE);
+                    }) as Box<dyn Fn()>);
+                    
+                    // Register change and keyup events
+                    let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
+                    let on_fn = on_method.unchecked_into::<js_sys::Function>();
+                    let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
+                    let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
+                    on_change.forget();
+                }) as Box<dyn Fn(JsValue)>);
+                
+                js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
+                setup_fn.forget();
+                
+                init(&options.into());
+                
+                // Set initial content after a brief delay
+                gloo_timers::future::TimeoutFuture::new(100).await;
+                if let Some(editor) = get("body-editor") {
+                    editor.set_content(&body_content);
+                }
+            });
+            
+            self.tinymce_initialized = true;
+        }
     }
 }
 

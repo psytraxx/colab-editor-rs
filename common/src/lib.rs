@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WsMessage {
+    /// Welcome message with assigned user ID
+    Welcome(String),
     /// Automerge sync message (binary)
     Sync(Vec<u8>),
     /// User state update (presence, cursor, editing mode)

@@ -104,6 +104,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     println!("[SERVER] New connection: {}", user_id);
 
+    // Send Welcome message
+    let welcome_msg = WsMessage::Welcome(user_id.clone());
+    let json = serde_json::to_string(&welcome_msg).unwrap();
+    if sender.send(Message::Text(json.into())).await.is_err() {
+        return;
+    }
+
     // Create initial user state (not editing yet)
     let user_state = UserState {
         user_id: user_id.clone(),
@@ -160,52 +167,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text.as_str()) {
                             match ws_msg {
                                 WsMessage::Sync(binary) => {
-                                    if let Ok(sync_msg) = sync::Message::decode(&binary) {
-                                        let reply_msg = {
-                                            let mut doc = state.doc.lock().await;
-                                            
-                                            let heads_before = doc.get_heads();
-                                            doc.sync().receive_sync_message(&mut sync_state, sync_msg).unwrap();
-                                            let heads_after = doc.get_heads();
-
-                                            if heads_before != heads_after {
-                                                let saved = doc.save();
-                                                state.db.insert("doc_data", saved).unwrap();
-                                                let _ = state.tx.send(BroadcastMsg::DocChanged);
-                                            }
-                                            
-                                            let x = doc.sync().generate_sync_message(&mut sync_state);
-                                            x
-                                        };
-
-                                        if let Some(msg) = reply_msg {
-                                            let resp = WsMessage::Sync(msg.encode());
-                                            let json = serde_json::to_string(&resp).unwrap();
-                                            if sender.send(Message::Text(json.into())).await.is_err() {
-                                                break;
-                                            }
+                                    if let Some(resp) = handle_sync_msg(&state, &mut sync_state, binary).await {
+                                        let json = serde_json::to_string(&resp).unwrap();
+                                        if sender.send(Message::Text(json.into())).await.is_err() {
+                                            break;
                                         }
                                     }
                                 }
-                                WsMessage::UserState(mut incoming_state) => {
-                                    println!("[SERVER] Received UserState from {}: editing={}, field={:?}", 
-                                        user_id, incoming_state.editing, incoming_state.field);
-                                    
-                                    // Fill in server-assigned user info
-                                    incoming_state.user_id = user_id.clone();
-                                    incoming_state.user_name = user_name.clone();
-                                    incoming_state.online = true;
-                                    
-                                    // Update stored state
-                                    {
-                                        let mut users = state.users.write().await;
-                                        users.insert(user_id.clone(), incoming_state.clone());
-                                    }
-                                    
-                                    println!("[SERVER] Broadcasting UserState: {} editing={} field={:?}", 
-                                        incoming_state.user_name, incoming_state.editing, incoming_state.field);
-                                    let _ = state.tx.send(BroadcastMsg::UserState(incoming_state));
+                                WsMessage::UserState(incoming_state) => {
+                                    handle_user_state_msg(&state, incoming_state, &user_id, &user_name).await;
                                 }
+                                WsMessage::Welcome(_) => {}
                             }
                         }
                     }
@@ -263,4 +235,54 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
     println!("[SERVER] Broadcasting offline state for {}", user_id);
     let _ = state.tx.send(BroadcastMsg::UserState(offline_state));
+}
+
+async fn handle_sync_msg(
+    state: &Arc<AppState>,
+    sync_state: &mut sync::State,
+    binary: Vec<u8>,
+) -> Option<WsMessage> {
+    if let Ok(sync_msg) = sync::Message::decode(&binary) {
+        let mut doc = state.doc.lock().await;
+        
+        let heads_before = doc.get_heads();
+        doc.sync().receive_sync_message(sync_state, sync_msg).unwrap();
+        let heads_after = doc.get_heads();
+
+        if heads_before != heads_after {
+            let saved = doc.save();
+            state.db.insert("doc_data", saved).unwrap();
+            let _ = state.tx.send(BroadcastMsg::DocChanged);
+        }
+        
+        let x = doc.sync().generate_sync_message(sync_state);
+        x.map(|msg| WsMessage::Sync(msg.encode()))
+    } else {
+        None
+    }
+}
+
+async fn handle_user_state_msg(
+    state: &Arc<AppState>,
+    mut incoming_state: UserState,
+    user_id: &str,
+    user_name: &str,
+) {
+    println!("[SERVER] Received UserState from {}: editing={}, field={:?}", 
+        user_id, incoming_state.editing, incoming_state.field);
+    
+    // Fill in server-assigned user info
+    incoming_state.user_id = user_id.to_string();
+    incoming_state.user_name = user_name.to_string();
+    incoming_state.online = true;
+    
+    // Update stored state
+    {
+        let mut users = state.users.write().await;
+        users.insert(user_id.to_string(), incoming_state.clone());
+    }
+    
+    println!("[SERVER] Broadcasting UserState: {} editing={} field={:?}", 
+        incoming_state.user_name, incoming_state.editing, incoming_state.field);
+    let _ = state.tx.send(BroadcastMsg::UserState(incoming_state));
 }
