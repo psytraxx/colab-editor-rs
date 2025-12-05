@@ -312,21 +312,21 @@ impl Component for App {
                         <span class="mode-badge mode-edit">{"EDIT MODE (CRDT Active)"}</span>
                         
                         <div class="field field-with-cursors">
-                            <label>{ "Keywords" }</label>
+                            <label>{ "Title" }</label>
                             <div class="input-wrapper">
                                 <input 
-                                    key="keywords"
+                                    key="title"
                                     type="text" 
-                                    value={keywords}
+                                    value={title}
                                     oninput={ctx.link().callback(|e: InputEvent| {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
+                                        Msg::UpdateField(DOC_KEY_TITLE, input.value())
                                     })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string()))) }
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
                                 />
                                 <div class="cursors">
-                                { for keywords_editors.iter().map(|user| {
+                                { for title_editors.iter().map(|user| {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
@@ -351,7 +351,7 @@ impl Component for App {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
                                         Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
                                     })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string())))}
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string()))) }
                                     onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
                                 />
                                 <div class="cursors">
@@ -492,9 +492,14 @@ impl App {
                 let options = js_sys::Object::new();
                 js_sys::Reflect::set(&options, &"selector".into(), &"#body-editor".into()).unwrap();
                 js_sys::Reflect::set(&options, &"inline".into(), &true.into()).unwrap();
-                js_sys::Reflect::set(&options, &"menubar".into(), &false.into()).unwrap();
-                js_sys::Reflect::set(&options, &"plugins".into(), &"lists link code".into()).unwrap();
-                js_sys::Reflect::set(&options, &"toolbar".into(), &"undo redo | bold italic underline | bullist numlist | link code".into()).unwrap();
+                // enable menubar so users can access format/insert options
+                js_sys::Reflect::set(&options, &"menubar".into(), &true.into()).unwrap();
+                // add common structural plugins
+                js_sys::Reflect::set(&options, &"plugins".into(), &"lists link image table code".into()).unwrap();
+                // richer toolbar including format selector, alignment and indenting
+                js_sys::Reflect::set(&options, &"toolbar".into(), &"formatselect | undo redo | bold italic underline | alignleft aligncenter alignright | outdent indent | bullist numlist | link image | code".into()).unwrap();
+                // define available block formats (paragraphs and headings)
+                js_sys::Reflect::set(&options, &"block_formats".into(), &"Paragraph=p;Heading 1=h1;Heading 2=h2;Heading 3=h3;Heading 4=h4".into()).unwrap();
                 js_sys::Reflect::set(&options, &"license_key".into(), &"gpl".into()).unwrap();
                 
                 // Setup callback for changes
