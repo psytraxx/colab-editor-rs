@@ -195,6 +195,7 @@ impl Component for App {
                     Mode::View => {
                         // Initialize TinyMCE after switching to edit mode
                         ctx.link().send_message(Msg::InitTinyMCE);
+                        ctx.link().send_message(Msg::SetEditing(Some("general".to_string())));
                         Mode::Edit
                     }
                     Mode::Edit => {
@@ -288,6 +289,14 @@ impl Component for App {
                     field
                 ).into());
                 
+                // Update our own state locally
+                if let Some(my_id) = &self.my_id {
+                    if let Some(my_state) = self.users.get_mut(my_id) {
+                        my_state.editing = field.is_some();
+                        my_state.field = field.clone();
+                    }
+                }
+                
                 if let Some(sender) = &mut self.ws_sender {
                     let user_state = UserState {
                         user_id: String::new(), // Server will fill this
@@ -311,7 +320,7 @@ impl Component for App {
                 } else {
                     log_1(&"[CLIENT] No ws_sender available!".into());
                 }
-                false
+                true  // Return true to trigger re-render
             }
             Msg::SendSync => {
                 if let Some(sender) = &mut self.ws_sender {
@@ -359,7 +368,6 @@ impl Component for App {
                                     <span 
                                         class={format!("user-badge {}", if user.editing { "active" } else { "inactive" })}
                                     >
-                                        <span class="status-dot"></span>
                                         { &user.user_name }
                                     </span>
                                 }
@@ -395,7 +403,7 @@ impl Component for App {
                                         Msg::UpdateField(DOC_KEY_TITLE, input.value())
                                     })}
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 />
                                 { for title_editors.iter().map(|user| {
                                     html! {
@@ -421,7 +429,7 @@ impl Component for App {
                                         Msg::UpdateField(DOC_KEY_DESCRIPTION, input.value())
                                     })}
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("description".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 />
                                 { for description_editors.iter().map(|user| {
                                     html! {
@@ -443,7 +451,7 @@ impl Component for App {
                                     id="body-editor" 
                                     class="inline-editor"
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 ></div>
                                 { for body_editors.iter().map(|user| {
                                     html! {
