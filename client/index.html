@@ -42,25 +42,27 @@
         border-radius: 16px;
         display: flex;
         align-items: center;
-        gap: 4px;
-        color: white;
+        gap: 6px;
         font-weight: 500;
         font-size: 12px;
         transition: all 0.2s;
+        background-color: #f5f5f5;
+        color: #333;
+        border: 1px solid #ddd;
       }
-      .user-badge.editing {
-        box-shadow: 0 0 0 2px white, 0 0 0 4px currentColor;
-      }
-      .editing-dot {
-        width: 6px;
-        height: 6px;
-        background: #4caf50;
+      .status-dot {
+        width: 8px;
+        height: 8px;
         border-radius: 50%;
+        background-color: #9e9e9e;
+      }
+      .user-badge.active .status-dot {
+        background-color: #4caf50;
         animation: pulse 1s infinite;
       }
       @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.7; transform: scale(1.2); }
       }
       
       /* Active editors panel */
@@ -77,6 +79,7 @@
       .editor-tag {
         padding: 4px 8px;
         border-radius: 4px;
+        background-color: #4caf50;
         color: white;
         font-size: 12px;
       }
@@ -94,6 +97,7 @@
         right: 0;
         padding: 2px 6px;
         border-radius: 4px;
+        background-color: #4caf50;
         color: white;
         font-size: 11px;
         font-weight: 500;

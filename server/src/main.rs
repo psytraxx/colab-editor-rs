@@ -19,14 +19,13 @@ use automerge::{
     sync::{self, SyncDoc},
     AutoCommit,
 };
-use common::{WsMessage, UserState, USER_COLORS, USER_NAMES};
+use common::{WsMessage, UserState};
 
 struct AppState {
     doc: Mutex<AutoCommit>,
     db: sled::Db,
     tx: broadcast::Sender<BroadcastMsg>,
     users: RwLock<HashMap<String, UserState>>,
-    user_counter: Mutex<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +66,6 @@ async fn main() {
         db,
         tx,
         users: RwLock::new(HashMap::new()),
-        user_counter: Mutex::new(0),
     });
 
     let app = Router::new()
@@ -92,23 +90,24 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut sync_state = sync::State::new();
     let mut rx = state.tx.subscribe();
 
-    // Assign user ID, random name and color
-    let (user_id, user_name, color) = {
-        let mut counter = state.user_counter.lock().await;
-        let id = format!("user_{}", *counter);
-        let name = USER_NAMES[*counter % USER_NAMES.len()].to_string();
-        let color = USER_COLORS[*counter % USER_COLORS.len()].to_string();
-        *counter += 1;
-        (id, name, color)
+    // Generate unique random 8-char ID for user
+    let user_name: String = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let chars: Vec<char> = "abcdefghijkmnpqrstuvwxyz23456789".chars().collect();
+        (0..8).map(|i| {
+            let idx = ((seed >> (i * 5)) as usize) % chars.len();
+            chars[idx]
+        }).collect()
     };
+    let user_id = user_name.clone();
 
-    println!("[SERVER] New connection: {} ({}) color={}", user_id, user_name, color);
+    println!("[SERVER] New connection: {}", user_id);
 
     // Create initial user state (not editing yet)
     let user_state = UserState {
         user_id: user_id.clone(),
         user_name: user_name.clone(),
-        color: color.clone(),
         editing: false,
         field: None,
         online: true,
@@ -195,7 +194,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     // Fill in server-assigned user info
                                     incoming_state.user_id = user_id.clone();
                                     incoming_state.user_name = user_name.clone();
-                                    incoming_state.color = color.clone();
                                     incoming_state.online = true;
                                     
                                     // Update stored state
@@ -259,7 +257,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let offline_state = UserState {
         user_id: user_id.clone(),
         user_name,
-        color,
         editing: false,
         field: None,
         online: false,

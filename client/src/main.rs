@@ -39,6 +39,8 @@ struct App {
     ws_sender: Option<Sender<Message>>,
     tinymce_initialized: bool,
     users: HashMap<String, UserState>,
+    my_id: Option<String>,
+    my_name: Option<String>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -108,6 +110,8 @@ impl Component for App {
             ws_sender: None,
             tinymce_initialized: false,
             users: HashMap::new(),
+            my_id: None,
+            my_name: None,
         }
     }
 
@@ -149,6 +153,13 @@ impl Component for App {
                             user_state.user_id, user_state.user_name, user_state.editing, 
                             user_state.field, user_state.online
                         ).into());
+                        
+                        // Capture our own identity from the first message about ourselves
+                        if self.my_id.is_none() {
+                            self.my_id = Some(user_state.user_id.clone());
+                            self.my_name = Some(user_state.user_name.clone());
+                            log_1(&format!("[CLIENT] My identity: {} ({})", user_state.user_name, user_state.user_id).into());
+                        }
                         
                         if user_state.online {
                             self.users.insert(user_state.user_id.clone(), user_state);
@@ -281,7 +292,6 @@ impl Component for App {
                     let user_state = UserState {
                         user_id: String::new(), // Server will fill this
                         user_name: String::new(),
-                        color: String::new(),
                         editing: field.is_some(),
                         field: field.clone(),
                         online: true,
@@ -335,29 +345,21 @@ impl Component for App {
         let body_editors: Vec<_> = self.users.values()
             .filter(|u| u.editing && u.field.as_deref() == Some("body"))
             .collect();
-        
-        // All active editors for the panel
-        let active_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing)
-            .collect();
 
         html! {
             <div>
                 <header style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                    <h1>{ "Editor Demo" }</h1>
+                    <h1>{ format!("Hello {}", self.my_name.as_deref().unwrap_or("...")) }</h1>
                     <div style="display: flex; align-items: center; gap: 10px;">
                         // Online users indicator
                         <div class="online-users">
                             { for self.users.values().map(|user| {
                                 html! {
                                     <span 
-                                        class={format!("user-badge {}", if user.editing { "editing" } else { "" })}
-                                        style={format!("background-color: {}", user.color)}
+                                        class={format!("user-badge {}", if user.editing { "active" } else { "inactive" })}
                                     >
+                                        <span class="status-dot"></span>
                                         { &user.user_name }
-                                        if user.editing {
-                                            <span class="editing-dot"></span>
-                                        }
                                     </span>
                                 }
                             })}
@@ -381,28 +383,6 @@ impl Component for App {
                     <div class="edit-mode">
                         <span class="mode-badge mode-edit">{"EDIT MODE (CRDT Active)"}</span>
                         
-                        // Show who's currently editing
-                        if !active_editors.is_empty() {
-                            <div class="active-editors">
-                                <strong>{"Currently editing: "}</strong>
-                                { for active_editors.iter().map(|user| {
-                                    html! {
-                                        <span 
-                                            class="editor-tag"
-                                            style={format!("background-color: {}", user.color)}
-                                        >
-                                            { &user.user_name }
-                                            { if let Some(ref field) = user.field {
-                                                format!(" ({})", field)
-                                            } else {
-                                                String::new()
-                                            }}
-                                        </span>
-                                    }
-                                })}
-                            </div>
-                        }
-                        
                         <div class="field field-with-cursors">
                             <label>{ "Title" }</label>
                             <div class="input-wrapper">
@@ -420,7 +400,6 @@ impl Component for App {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
-                                            style={format!("background-color: {}", user.color)}
                                             title={user.user_name.clone()}
                                         >
                                             { &user.user_name }
@@ -447,7 +426,6 @@ impl Component for App {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
-                                            style={format!("background-color: {}", user.color)}
                                             title={user.user_name.clone()}
                                         >
                                             { &user.user_name }
@@ -470,7 +448,6 @@ impl Component for App {
                                     html! {
                                         <span 
                                             class="cursor-indicator" 
-                                            style={format!("background-color: {}", user.color)}
                                             title={user.user_name.clone()}
                                         >
                                             { &user.user_name }
