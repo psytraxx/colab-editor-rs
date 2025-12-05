@@ -1,9 +1,9 @@
-name: Deploy P2P Editor to GitHub Pages
+es
 
 on:
-  workflow_dispatch:
-    inputs:
-      branch:
+  push:
+    branches:
+      -
         description: 'Branch to deploy'
         required: true
         default: 'peer'
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.branch }}
 
