@@ -6,14 +6,36 @@ use automerge::{
 use common::{WsMessage, DOC_KEY_BODY, DOC_KEY_DESCRIPTION, DOC_KEY_TITLE, DOC_KEY_VERSION};
 use futures::{channel::mpsc::Sender, SinkExt, StreamExt};
 use gloo::net::websocket::{futures::WebSocket, Message};
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = tinymce)]
+    fn init(options: &JsValue);
+    
+    #[wasm_bindgen(js_namespace = tinymce)]
+    fn get(id: &str) -> Option<TinyMCEEditor>;
+    
+    #[wasm_bindgen(js_namespace = tinymce)]
+    fn remove(selector: &str);
+    
+    type TinyMCEEditor;
+    
+    #[wasm_bindgen(method, js_name = getContent)]
+    fn get_content(this: &TinyMCEEditor) -> String;
+    
+    #[wasm_bindgen(method, js_name = setContent)]
+    fn set_content(this: &TinyMCEEditor, content: &str);
+}
 
 struct App {
     doc: AutoCommit,
     sync_state: sync::State,
     mode: Mode,
     ws_sender: Option<Sender<Message>>,
+    tinymce_initialized: bool,
 }
 
 #[derive(PartialEq, Clone)]
@@ -28,6 +50,8 @@ enum Msg {
     UpdateField(&'static str, String),
     ToggleMode,
     SendSync,
+    InitTinyMCE,
+    SyncBodyFromTinyMCE,
 }
 
 impl Component for App {
@@ -63,6 +87,7 @@ impl Component for App {
             sync_state: sync::State::new(),
             mode: Mode::View,
             ws_sender: None,
+            tinymce_initialized: false,
         }
     }
 
@@ -77,7 +102,21 @@ impl Component for App {
                 match ws_msg {
                     WsMessage::Sync(binary) => {
                         if let Ok(sync_msg) = sync::Message::decode(&binary) {
+                            let heads_before = self.doc.get_heads();
                             self.doc.sync().receive_sync_message(&mut self.sync_state, sync_msg).unwrap();
+                            let heads_after = self.doc.get_heads();
+                            
+                            // Update TinyMCE if body changed from remote and we're in edit mode
+                            if heads_before != heads_after && self.tinymce_initialized {
+                                if let Some(editor) = get("body-editor") {
+                                    let new_body = self.get_str(DOC_KEY_BODY);
+                                    let current_content = editor.get_content();
+                                    if new_body != current_content {
+                                        editor.set_content(&new_body);
+                                    }
+                                }
+                            }
+                            
                             ctx.link().send_message(Msg::SendSync);
                             true
                         } else {
@@ -103,10 +142,93 @@ impl Component for App {
             }
             Msg::ToggleMode => {
                 self.mode = match self.mode {
-                    Mode::View => Mode::Edit,
-                    Mode::Edit => Mode::View,
+                    Mode::View => {
+                        // Initialize TinyMCE after switching to edit mode
+                        ctx.link().send_message(Msg::InitTinyMCE);
+                        Mode::Edit
+                    }
+                    Mode::Edit => {
+                        // Sync body from TinyMCE before switching to view
+                        if self.tinymce_initialized {
+                            if let Some(editor) = get("body-editor") {
+                                let content = editor.get_content();
+                                let current = self.get_str(DOC_KEY_BODY);
+                                if current != content {
+                                    self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
+                                    let current_version = self.get_u64(DOC_KEY_VERSION);
+                                    self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
+                                    ctx.link().send_message(Msg::SendSync);
+                                }
+                            }
+                            remove("#body-editor");
+                            self.tinymce_initialized = false;
+                        }
+                        Mode::View
+                    }
                 };
                 true
+            }
+            Msg::InitTinyMCE => {
+                if !self.tinymce_initialized {
+                    let link = ctx.link().clone();
+                    let body_content = self.get_str(DOC_KEY_BODY);
+                    
+                    // Delay initialization to ensure DOM is ready
+                    spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(50).await;
+                        
+                        let options = js_sys::Object::new();
+                        js_sys::Reflect::set(&options, &"selector".into(), &"#body-editor".into()).unwrap();
+                        js_sys::Reflect::set(&options, &"inline".into(), &true.into()).unwrap();
+                        js_sys::Reflect::set(&options, &"menubar".into(), &false.into()).unwrap();
+                        js_sys::Reflect::set(&options, &"plugins".into(), &"lists link code".into()).unwrap();
+                        js_sys::Reflect::set(&options, &"toolbar".into(), &"undo redo | bold italic underline | bullist numlist | link code".into()).unwrap();
+                        js_sys::Reflect::set(&options, &"license_key".into(), &"gpl".into()).unwrap();
+                        
+                        // Setup callback for changes
+                        let link_clone = link.clone();
+                        let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
+                            let link_inner = link_clone.clone();
+                            let on_change = Closure::wrap(Box::new(move || {
+                                link_inner.send_message(Msg::SyncBodyFromTinyMCE);
+                            }) as Box<dyn Fn()>);
+                            
+                            // Register change and keyup events
+                            let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
+                            let on_fn = on_method.unchecked_into::<js_sys::Function>();
+                            let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
+                            let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
+                            on_change.forget();
+                        }) as Box<dyn Fn(JsValue)>);
+                        
+                        js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
+                        setup_fn.forget();
+                        
+                        init(&options.into());
+                        
+                        // Set initial content after a brief delay
+                        gloo_timers::future::TimeoutFuture::new(100).await;
+                        if let Some(editor) = get("body-editor") {
+                            editor.set_content(&body_content);
+                        }
+                    });
+                    
+                    self.tinymce_initialized = true;
+                }
+                false
+            }
+            Msg::SyncBodyFromTinyMCE => {
+                if let Some(editor) = get("body-editor") {
+                    let content = editor.get_content();
+                    let current = self.get_str(DOC_KEY_BODY);
+                    if current != content {
+                        self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
+                        let current_version = self.get_u64(DOC_KEY_VERSION);
+                        self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
+                        ctx.link().send_message(Msg::SendSync);
+                    }
+                }
+                false
             }
             Msg::SendSync => {
                 if let Some(sender) = &mut self.ws_sender {
@@ -148,7 +270,7 @@ impl Component for App {
                         <h2>{ title }</h2>
                         <p style="font-style: italic;">{ description }</p>
                         <hr/>
-                        <div style="white-space: pre-wrap;">{ body }</div>
+                        <div class="body-content">{Html::from_html_unchecked(body.into())}</div>
                     </div>
                 } else {
                     <div class="edit-mode">
@@ -180,13 +302,7 @@ impl Component for App {
 
                         <div class="field">
                             <label>{ "Body" }</label>
-                            <textarea 
-                                value={body}
-                                oninput={ctx.link().callback(|e: InputEvent| {
-                                    let input: web_sys::HtmlTextAreaElement = e.target_unchecked_into();
-                                    Msg::UpdateField(DOC_KEY_BODY, input.value())
-                                })}
-                            />
+                            <div id="body-editor" class="inline-editor"></div>
                         </div>
                     </div>
                 }

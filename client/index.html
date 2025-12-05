@@ -4,14 +4,32 @@
     <meta charset="utf-8" />
     <title>Colab Editor</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <script src="tinymce/tinymce.min.js"></script>
+    <link data-trunk rel="copy-dir" href="node_modules/tinymce" />
     <style>
       body { max-width: 800px; margin: 0 auto; padding: 20px; }
       .field { margin-bottom: 15px; }
-      textarea { height: 200px; }
       .version { color: var(--muted-color); font-size: 0.8em; }
       .mode-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; color: white; font-weight: bold; }
       .mode-view { background-color: var(--primary); }
       .mode-edit { background-color: var(--pico-color-orange-500, #f57c00); }
+      .inline-editor {
+        min-height: 200px;
+        border: 1px solid var(--pico-form-element-border-color);
+        border-radius: var(--pico-border-radius);
+        padding: 1rem;
+        background-color: var(--pico-form-element-background-color);
+      }
+      .inline-editor:focus {
+        border-color: var(--pico-form-element-active-border-color);
+        outline: none;
+      }
+      .body-content {
+        min-height: 100px;
+        padding: 1rem;
+        background: var(--card-background-color);
+        border-radius: var(--border-radius);
+      }
     </style>
   </head>
   <body>
