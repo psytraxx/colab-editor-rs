@@ -1,4 +1,4 @@
-# WebRTC Collaborative Editor (Rust + WASM)
+git-u# WebRTC Collaborative Editor (Rust + WASM)
 
 A **serverless peer-to-peer collaborative text editor** built with Rust, WebAssembly, Automerge CRDT, and WebRTC.
 
