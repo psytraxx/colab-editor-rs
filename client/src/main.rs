@@ -3,9 +3,11 @@ use automerge::{
     transaction::Transactable,
     AutoCommit, ReadDoc,
 };
-use common::{WsMessage, DOC_KEY_BODY, DOC_KEY_DESCRIPTION, DOC_KEY_TITLE, DOC_KEY_VERSION};
+use common::{WsMessage, UserState, DOC_KEY_BODY, DOC_KEY_DESCRIPTION, DOC_KEY_TITLE, DOC_KEY_VERSION};
 use futures::{channel::mpsc::Sender, SinkExt, StreamExt};
 use gloo::net::websocket::{futures::WebSocket, Message};
+use web_sys::console::log_1;
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -36,6 +38,7 @@ struct App {
     mode: Mode,
     ws_sender: Option<Sender<Message>>,
     tinymce_initialized: bool,
+    users: HashMap<String, UserState>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -52,6 +55,7 @@ enum Msg {
     SendSync,
     InitTinyMCE,
     SyncBodyFromTinyMCE,
+    SetEditing(Option<String>), // field name or None to stop editing
 }
 
 impl Component for App {
@@ -74,9 +78,24 @@ impl Component for App {
             });
 
             while let Some(msg) = read.next().await {
-                if let Ok(Message::Text(text)) = msg {
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        link.send_message(Msg::WsMessage(ws_msg));
+                match &msg {
+                    Ok(Message::Text(text)) => {
+                        log_1(&format!("[CLIENT] Raw WS message: {}", text).into());
+                        match serde_json::from_str::<WsMessage>(&text) {
+                            Ok(ws_msg) => {
+                                log_1(&"[CLIENT] Parsed WsMessage successfully".into());
+                                link.send_message(Msg::WsMessage(ws_msg));
+                            }
+                            Err(e) => {
+                                log_1(&format!("[CLIENT] Failed to parse WsMessage: {:?}", e).into());
+                            }
+                        }
+                    }
+                    Ok(other) => {
+                        log_1(&format!("[CLIENT] Non-text WS message: {:?}", other).into());
+                    }
+                    Err(e) => {
+                        log_1(&format!("[CLIENT] WS error: {:?}", e).into());
                     }
                 }
             }
@@ -88,6 +107,7 @@ impl Component for App {
             mode: Mode::View,
             ws_sender: None,
             tinymce_initialized: false,
+            users: HashMap::new(),
         }
     }
 
@@ -123,7 +143,26 @@ impl Component for App {
                             false
                         }
                     }
-                    _ => false,
+                    WsMessage::UserState(user_state) => {
+                        log_1(&format!(
+                            "[CLIENT] Received UserState: id={} name={} editing={} field={:?} online={}",
+                            user_state.user_id, user_state.user_name, user_state.editing, 
+                            user_state.field, user_state.online
+                        ).into());
+                        
+                        if user_state.online {
+                            self.users.insert(user_state.user_id.clone(), user_state);
+                        } else {
+                            self.users.remove(&user_state.user_id);
+                        }
+                        
+                        log_1(&format!(
+                            "[CLIENT] Total users in map: {}",
+                            self.users.len()
+                        ).into());
+                        
+                        true
+                    }
                 }
             }
             Msg::UpdateField(key, value) => {
@@ -163,6 +202,8 @@ impl Component for App {
                             remove("#body-editor");
                             self.tinymce_initialized = false;
                         }
+                        // Signal we stopped editing
+                        ctx.link().send_message(Msg::SetEditing(None));
                         Mode::View
                     }
                 };
@@ -230,6 +271,38 @@ impl Component for App {
                 }
                 false
             }
+            Msg::SetEditing(field) => {
+                log_1(&format!(
+                    "[CLIENT] SetEditing called with field={:?}",
+                    field
+                ).into());
+                
+                if let Some(sender) = &mut self.ws_sender {
+                    let user_state = UserState {
+                        user_id: String::new(), // Server will fill this
+                        user_name: String::new(),
+                        color: String::new(),
+                        editing: field.is_some(),
+                        field: field.clone(),
+                        online: true,
+                    };
+                    let ws_msg = WsMessage::UserState(user_state);
+                    let json = serde_json::to_string(&ws_msg).unwrap();
+                    
+                    log_1(&format!(
+                        "[CLIENT] Sending UserState: editing={} field={:?}",
+                        field.is_some(), field
+                    ).into());
+                    
+                    let mut tx = sender.clone();
+                    spawn_local(async move {
+                        tx.send(Message::Text(json)).await.unwrap();
+                    });
+                } else {
+                    log_1(&"[CLIENT] No ws_sender available!".into());
+                }
+                false
+            }
             Msg::SendSync => {
                 if let Some(sender) = &mut self.ws_sender {
                     if let Some(msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
@@ -252,13 +325,45 @@ impl Component for App {
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
 
+        // Get users editing each field
+        let title_editors: Vec<_> = self.users.values()
+            .filter(|u| u.editing && u.field.as_deref() == Some("title"))
+            .collect();
+        let description_editors: Vec<_> = self.users.values()
+            .filter(|u| u.editing && u.field.as_deref() == Some("description"))
+            .collect();
+        let body_editors: Vec<_> = self.users.values()
+            .filter(|u| u.editing && u.field.as_deref() == Some("body"))
+            .collect();
+        
+        // All active editors for the panel
+        let active_editors: Vec<_> = self.users.values()
+            .filter(|u| u.editing)
+            .collect();
+
         html! {
             <div>
                 <header style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                    <h1>{ "Colab Editor Demo" }</h1>
-                    <div>
-                        <span class="version">{ format!("Version: {}", version) }</span>
-                        <button onclick={ctx.link().callback(|_| Msg::ToggleMode)} style="margin-left: 10px;">
+                    <h1>{ "Editor Demo" }</h1>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        // Online users indicator
+                        <div class="online-users">
+                            { for self.users.values().map(|user| {
+                                html! {
+                                    <span 
+                                        class={format!("user-badge {}", if user.editing { "editing" } else { "" })}
+                                        style={format!("background-color: {}", user.color)}
+                                    >
+                                        { &user.user_name }
+                                        if user.editing {
+                                            <span class="editing-dot"></span>
+                                        }
+                                    </span>
+                                }
+                            })}
+                        </div>
+                        <span class="version">{ format!("v{}", version) }</span>
+                        <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
                             { match self.mode { Mode::View => "Edit", Mode::Edit => "View" } }
                         </button>
                     </div>
@@ -276,33 +381,103 @@ impl Component for App {
                     <div class="edit-mode">
                         <span class="mode-badge mode-edit">{"EDIT MODE (CRDT Active)"}</span>
                         
-                        <div class="field">
+                        // Show who's currently editing
+                        if !active_editors.is_empty() {
+                            <div class="active-editors">
+                                <strong>{"Currently editing: "}</strong>
+                                { for active_editors.iter().map(|user| {
+                                    html! {
+                                        <span 
+                                            class="editor-tag"
+                                            style={format!("background-color: {}", user.color)}
+                                        >
+                                            { &user.user_name }
+                                            { if let Some(ref field) = user.field {
+                                                format!(" ({})", field)
+                                            } else {
+                                                String::new()
+                                            }}
+                                        </span>
+                                    }
+                                })}
+                            </div>
+                        }
+                        
+                        <div class="field field-with-cursors">
                             <label>{ "Title" }</label>
-                            <input 
-                                type="text" 
-                                value={title} 
-                                oninput={ctx.link().callback(|e: InputEvent| {
-                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                    Msg::UpdateField(DOC_KEY_TITLE, input.value())
+                            <div class="input-wrapper">
+                                <input 
+                                    type="text" 
+                                    value={title} 
+                                    oninput={ctx.link().callback(|e: InputEvent| {
+                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                        Msg::UpdateField(DOC_KEY_TITLE, input.value())
+                                    })}
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string())))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                />
+                                { for title_editors.iter().map(|user| {
+                                    html! {
+                                        <span 
+                                            class="cursor-indicator" 
+                                            style={format!("background-color: {}", user.color)}
+                                            title={user.user_name.clone()}
+                                        >
+                                            { &user.user_name }
+                                        </span>
+                                    }
                                 })}
-                            />
+                            </div>
                         </div>
 
-                        <div class="field">
+                        <div class="field field-with-cursors">
                             <label>{ "Description" }</label>
-                            <input 
-                                type="text" 
-                                value={description}
-                                oninput={ctx.link().callback(|e: InputEvent| {
-                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                    Msg::UpdateField(DOC_KEY_DESCRIPTION, input.value())
+                            <div class="input-wrapper">
+                                <input 
+                                    type="text" 
+                                    value={description}
+                                    oninput={ctx.link().callback(|e: InputEvent| {
+                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                        Msg::UpdateField(DOC_KEY_DESCRIPTION, input.value())
+                                    })}
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("description".to_string())))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                />
+                                { for description_editors.iter().map(|user| {
+                                    html! {
+                                        <span 
+                                            class="cursor-indicator" 
+                                            style={format!("background-color: {}", user.color)}
+                                            title={user.user_name.clone()}
+                                        >
+                                            { &user.user_name }
+                                        </span>
+                                    }
                                 })}
-                            />
+                            </div>
                         </div>
 
-                        <div class="field">
+                        <div class="field field-with-cursors">
                             <label>{ "Body" }</label>
-                            <div id="body-editor" class="inline-editor"></div>
+                            <div class="input-wrapper">
+                                <div 
+                                    id="body-editor" 
+                                    class="inline-editor"
+                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
+                                    onblur={ctx.link().callback(|_| Msg::SetEditing(None))}
+                                ></div>
+                                { for body_editors.iter().map(|user| {
+                                    html! {
+                                        <span 
+                                            class="cursor-indicator" 
+                                            style={format!("background-color: {}", user.color)}
+                                            title={user.user_name.clone()}
+                                        >
+                                            { &user.user_name }
+                                        </span>
+                                    }
+                                })}
+                            </div>
                         </div>
                     </div>
                 }

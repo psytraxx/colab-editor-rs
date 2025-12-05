@@ -9,8 +9,9 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
-use tokio::sync::{broadcast, Mutex};
-use std::sync::Arc; // Arc still from std
+use std::collections::HashMap;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use automerge::{
@@ -18,12 +19,20 @@ use automerge::{
     sync::{self, SyncDoc},
     AutoCommit,
 };
-use common::WsMessage;
+use common::{WsMessage, UserState, USER_COLORS, USER_NAMES};
 
 struct AppState {
     doc: Mutex<AutoCommit>,
     db: sled::Db,
-    tx: broadcast::Sender<()>,
+    tx: broadcast::Sender<BroadcastMsg>,
+    users: RwLock<HashMap<String, UserState>>,
+    user_counter: Mutex<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum BroadcastMsg {
+    DocChanged,
+    UserState(UserState),
 }
 
 #[tokio::main]
@@ -57,6 +66,8 @@ async fn main() {
         doc: Mutex::new(doc),
         db,
         tx,
+        users: RwLock::new(HashMap::new()),
+        user_counter: Mutex::new(0),
     });
 
     let app = Router::new()
@@ -81,6 +92,52 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut sync_state = sync::State::new();
     let mut rx = state.tx.subscribe();
 
+    // Assign user ID, random name and color
+    let (user_id, user_name, color) = {
+        let mut counter = state.user_counter.lock().await;
+        let id = format!("user_{}", *counter);
+        let name = USER_NAMES[*counter % USER_NAMES.len()].to_string();
+        let color = USER_COLORS[*counter % USER_COLORS.len()].to_string();
+        *counter += 1;
+        (id, name, color)
+    };
+
+    println!("[SERVER] New connection: {} ({}) color={}", user_id, user_name, color);
+
+    // Create initial user state (not editing yet)
+    let user_state = UserState {
+        user_id: user_id.clone(),
+        user_name: user_name.clone(),
+        color: color.clone(),
+        editing: false,
+        field: None,
+        online: true,
+    };
+    
+    {
+        let mut users = state.users.write().await;
+        users.insert(user_id.clone(), user_state.clone());
+        println!("[SERVER] Total users now: {}", users.len());
+    }
+
+    // Send existing users to new client
+    {
+        let users = state.users.read().await;
+        println!("[SERVER] Sending {} existing users to new client {}", users.len(), user_id);
+        for (uid, user) in users.iter() {
+            println!("[SERVER]   -> Sending user {} to {}", uid, user_id);
+            let msg = WsMessage::UserState(user.clone());
+            let json = serde_json::to_string(&msg).unwrap();
+            if sender.send(Message::Text(json.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Broadcast new user to others
+    println!("[SERVER] Broadcasting new user {} to others", user_id);
+    let _ = state.tx.send(BroadcastMsg::UserState(user_state));
+
     // Initial Sync
     let initial_msg = {
         let mut doc = state.doc.lock().await;
@@ -89,11 +146,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     if let Some(msg) = initial_msg {
-         let ws_msg = WsMessage::Sync(msg.encode());
-         let json = serde_json::to_string(&ws_msg).unwrap();
-         if sender.send(Message::Text(json.into())).await.is_err() {
-             return;
-         }
+        let ws_msg = WsMessage::Sync(msg.encode());
+        let json = serde_json::to_string(&ws_msg).unwrap();
+        if sender.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
     }
 
     loop {
@@ -115,15 +172,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             if heads_before != heads_after {
                                                 let saved = doc.save();
                                                 state.db.insert("doc_data", saved).unwrap();
-                                                
-                                                // Notify others
-                                                let _ = state.tx.send(());
+                                                let _ = state.tx.send(BroadcastMsg::DocChanged);
                                             }
                                             
-                                            // Generate reply while lock is held
                                             let x = doc.sync().generate_sync_message(&mut sync_state);
                                             x
-                                        }; // Lock dropped
+                                        };
 
                                         if let Some(msg) = reply_msg {
                                             let resp = WsMessage::Sync(msg.encode());
@@ -134,27 +188,82 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     }
                                 }
-                                _ => {}
+                                WsMessage::UserState(mut incoming_state) => {
+                                    println!("[SERVER] Received UserState from {}: editing={}, field={:?}", 
+                                        user_id, incoming_state.editing, incoming_state.field);
+                                    
+                                    // Fill in server-assigned user info
+                                    incoming_state.user_id = user_id.clone();
+                                    incoming_state.user_name = user_name.clone();
+                                    incoming_state.color = color.clone();
+                                    incoming_state.online = true;
+                                    
+                                    // Update stored state
+                                    {
+                                        let mut users = state.users.write().await;
+                                        users.insert(user_id.clone(), incoming_state.clone());
+                                    }
+                                    
+                                    println!("[SERVER] Broadcasting UserState: {} editing={} field={:?}", 
+                                        incoming_state.user_name, incoming_state.editing, incoming_state.field);
+                                    let _ = state.tx.send(BroadcastMsg::UserState(incoming_state));
+                                }
                             }
                         }
                     }
                     _ => break,
                 }
             }
-            _ = rx.recv() => {
-                let reply_msg = {
-                    let mut doc = state.doc.lock().await;                    let x = doc.sync().generate_sync_message(&mut sync_state);
-                    x
-                };
+            result = rx.recv() => {
+                match result {
+                    Ok(BroadcastMsg::DocChanged) => {
+                        let reply_msg = {
+                            let mut doc = state.doc.lock().await;
+                            let x = doc.sync().generate_sync_message(&mut sync_state);
+                            x
+                        };
 
-                if let Some(msg) = reply_msg {
-                    let resp = WsMessage::Sync(msg.encode());
-                    let json = serde_json::to_string(&resp).unwrap();
-                     if sender.send(Message::Text(json.into())).await.is_err() {
-                        break;
+                        if let Some(msg) = reply_msg {
+                            let resp = WsMessage::Sync(msg.encode());
+                            let json = serde_json::to_string(&resp).unwrap();
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Ok(BroadcastMsg::UserState(user_state)) => {
+                        // Don't send own state back
+                        if user_state.user_id != user_id {
+                            println!("[SERVER] Sending UserState to {}: {} (editing={}, field={:?}, online={})", 
+                                user_id, user_state.user_name, user_state.editing, user_state.field, user_state.online);
+                            let msg = WsMessage::UserState(user_state);
+                            let json = serde_json::to_string(&msg).unwrap();
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         }
     }
+
+    // User disconnected
+    println!("[SERVER] User {} ({}) disconnected", user_id, user_name);
+    {
+        let mut users = state.users.write().await;
+        users.remove(&user_id);
+        println!("[SERVER] Total users now: {}", users.len());
+    }
+    let offline_state = UserState {
+        user_id: user_id.clone(),
+        user_name,
+        color,
+        editing: false,
+        field: None,
+        online: false,
+    };
+    println!("[SERVER] Broadcasting offline state for {}", user_id);
+    let _ = state.tx.send(BroadcastMsg::UserState(offline_state));
 }

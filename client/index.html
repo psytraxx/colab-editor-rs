@@ -5,14 +5,14 @@
     <title>Colab Editor</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
     <script src="tinymce/tinymce.min.js"></script>
-    <link data-trunk rel="copy-dir" href="node_modules/tinymce" />
+    <link data-trunk rel="copy-dir" href="static/tinymce" />
     <style>
       body { max-width: 800px; margin: 0 auto; padding: 20px; }
       .field { margin-bottom: 15px; }
       .version { color: var(--muted-color); font-size: 0.8em; }
-      .mode-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; color: white; font-weight: bold; }
-      .mode-view { background-color: var(--primary); }
-      .mode-edit { background-color: var(--pico-color-orange-500, #f57c00); }
+      .mode-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; color: white; font-weight: bold; margin-bottom: 1rem; }
+      .mode-view { background-color: var(--pico-primary); }
+      .mode-edit { background-color: #f57c00; }
       .inline-editor {
         min-height: 200px;
         border: 1px solid var(--pico-form-element-border-color);
@@ -27,8 +27,86 @@
       .body-content {
         min-height: 100px;
         padding: 1rem;
-        background: var(--card-background-color);
-        border-radius: var(--border-radius);
+        background: var(--pico-card-background-color);
+        border-radius: var(--pico-border-radius);
+      }
+      
+      /* Online users */
+      .online-users {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .user-badge {
+        padding: 4px 10px;
+        border-radius: 16px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        color: white;
+        font-weight: 500;
+        font-size: 12px;
+        transition: all 0.2s;
+      }
+      .user-badge.editing {
+        box-shadow: 0 0 0 2px white, 0 0 0 4px currentColor;
+      }
+      .editing-dot {
+        width: 6px;
+        height: 6px;
+        background: #4caf50;
+        border-radius: 50%;
+        animation: pulse 1s infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+      }
+      
+      /* Active editors panel */
+      .active-editors {
+        margin-bottom: 1rem;
+        padding: 0.75rem;
+        background: var(--pico-card-background-color);
+        border-radius: var(--pico-border-radius);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .editor-tag {
+        padding: 4px 8px;
+        border-radius: 4px;
+        color: white;
+        font-size: 12px;
+      }
+      
+      /* Cursor indicators */
+      .field-with-cursors {
+        position: relative;
+      }
+      .input-wrapper {
+        position: relative;
+      }
+      .cursor-indicator {
+        position: absolute;
+        top: -20px;
+        right: 0;
+        padding: 2px 6px;
+        border-radius: 4px;
+        color: white;
+        font-size: 11px;
+        font-weight: 500;
+        white-space: nowrap;
+        z-index: 10;
+        animation: fade-in 0.2s ease-in;
+      }
+      .cursor-indicator:nth-child(3) { right: auto; left: 0; }
+      .cursor-indicator:nth-child(4) { right: 80px; }
+      
+      @keyframes fade-in {
+        from { opacity: 0; transform: translateY(5px); }
+        to { opacity: 1; transform: translateY(0); }
       }
     </style>
   </head>
