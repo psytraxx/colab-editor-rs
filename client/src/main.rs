@@ -67,7 +67,13 @@ impl Component for App {
     fn create(ctx: &Context<Self>) -> Self {
         let link = ctx.link().clone();
         spawn_local(async move {
-            let ws = WebSocket::open("ws://127.0.0.1:3000/ws").unwrap();
+            // Build WS URL from current browser location (use same host, connect to backend on port 3000)
+            let window = web_sys::window().expect("no global `window` exists");
+            let location = window.location();
+            let hostname = location.hostname().unwrap_or_else(|_| "127.0.0.1".to_string());
+            let ws_url = format!("ws://{}:3000/ws", hostname);
+
+            let ws = WebSocket::open(&ws_url).unwrap();
             let (mut write, mut read) = ws.split();
             let (tx, mut rx) = futures::channel::mpsc::channel::<Message>(1000);
 
