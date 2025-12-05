@@ -161,8 +161,16 @@ impl Component for App {
                             log_1(&format!("[CLIENT] My identity: {} ({})", user_state.user_name, user_state.user_id).into());
                         }
                         
+                        // Don't overwrite our own state from server - we manage it locally
+                        let dominated_by_local = self.my_id.as_ref() == Some(&user_state.user_id);
+                        
                         if user_state.online {
-                            self.users.insert(user_state.user_id.clone(), user_state);
+                            if dominated_by_local {
+                                // Only update our entry if we don't have one yet
+                                self.users.entry(user_state.user_id.clone()).or_insert(user_state);
+                            } else {
+                                self.users.insert(user_state.user_id.clone(), user_state);
+                            }
                         } else {
                             self.users.remove(&user_state.user_id);
                         }
@@ -396,6 +404,7 @@ impl Component for App {
                             <label>{ "Title" }</label>
                             <div class="input-wrapper">
                                 <input 
+                                    key="title"
                                     type="text" 
                                     value={title} 
                                     oninput={ctx.link().callback(|e: InputEvent| {
@@ -405,6 +414,7 @@ impl Component for App {
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string())))}
                                     onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 />
+                                <div class="cursors">
                                 { for title_editors.iter().map(|user| {
                                     html! {
                                         <span 
@@ -415,6 +425,7 @@ impl Component for App {
                                         </span>
                                     }
                                 })}
+                                </div>
                             </div>
                         </div>
 
@@ -422,6 +433,7 @@ impl Component for App {
                             <label>{ "Description" }</label>
                             <div class="input-wrapper">
                                 <input 
+                                    key="description"
                                     type="text" 
                                     value={description}
                                     oninput={ctx.link().callback(|e: InputEvent| {
@@ -431,6 +443,7 @@ impl Component for App {
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("description".to_string())))}
                                     onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 />
+                                <div class="cursors">
                                 { for description_editors.iter().map(|user| {
                                     html! {
                                         <span 
@@ -441,6 +454,7 @@ impl Component for App {
                                         </span>
                                     }
                                 })}
+                                </div>
                             </div>
                         </div>
 
@@ -453,6 +467,7 @@ impl Component for App {
                                     onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
                                     onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                                 ></div>
+                                <div class="cursors">
                                 { for body_editors.iter().map(|user| {
                                     html! {
                                         <span 
@@ -463,6 +478,7 @@ impl Component for App {
                                         </span>
                                     }
                                 })}
+                                </div>
                             </div>
                         </div>
                     </div>
