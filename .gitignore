@@ -2,3 +2,4 @@
 /server/my_db/
 /client/dist/
 /client/node_modules/
+/client/target/

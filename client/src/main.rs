@@ -3,12 +3,36 @@ use automerge::{
     transaction::Transactable,
     AutoCommit, ReadDoc,
 };
-use common::{WsMessage, UserState, DOC_KEY_BODY, DOC_KEY_KEYWORDS, DOC_KEY_TITLE, DOC_KEY_VERSION};
-use web_sys::console::log_1;
+use web_sys::{console::log_1, WebSocket, MessageEvent, CloseEvent, ErrorEvent};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
+use serde::{Deserialize, Serialize};
+
+// Document field keys
+const DOC_KEY_TITLE: &str = "title";
+const DOC_KEY_BODY: &str = "body";
+const DOC_KEY_KEYWORDS: &str = "keywords";
+const DOC_KEY_VERSION: &str = "version";
+
+// WebSocket message types
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "PascalCase")]
+enum WsMessage {
+    Welcome(String),
+    Sync(Vec<u8>),
+    UserState(UserState),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct UserState {
+    user_id: String,
+    user_name: String,
+    editing: bool,
+    field: Option<String>,
+    online: bool,
+}
 
 #[wasm_bindgen]
 extern "C" {
@@ -45,50 +69,15 @@ extern "C" {
     fn move_to_bookmark(this: &TinyMCESelection, bookmark: &JsValue);
 }
 
-// PeerJS bindings
-#[wasm_bindgen(module = "/inline_peer.js")]
-extern "C" {
-    pub type Peer;
-
-    #[wasm_bindgen(js_name = newPeer)]
-    fn new_peer(id: Option<String>) -> Peer;
-
-    #[wasm_bindgen(method, getter)]
-    fn id(this: &Peer) -> Option<String>;
-
-    #[wasm_bindgen(method)]
-    fn connect(this: &Peer, peer_id: &str) -> DataConnection;
-
-    #[wasm_bindgen(method)]
-    fn on(this: &Peer, event: &str, callback: &JsValue);
-
-    pub type DataConnection;
-
-    #[wasm_bindgen(method)]
-    fn on(this: &DataConnection, event: &str, callback: &JsValue);
-
-    #[wasm_bindgen(method)]
-    fn send(this: &DataConnection, data: &str);
-
-    #[wasm_bindgen(method, getter)]
-    fn peer(this: &DataConnection) -> String;
-
-    // Clipboard helper
-    #[wasm_bindgen(js_name = copyToClipboard)]
-    async fn copy_to_clipboard(text: &str) -> JsValue;
-}
-
 struct App {
     doc: AutoCommit,
-    sync_states: HashMap<String, sync::State>, // Per-peer sync state
+    sync_state: sync::State,  // Single sync state for server
     mode: Mode,
-    peer: Option<Peer>,
-    connections: HashMap<String, DataConnection>, // peer_id -> connection
+    ws: Option<WebSocket>,
     tinymce_initialized: bool,
     users: HashMap<String, UserState>,
     my_id: Option<String>,
     my_name: Option<String>,
-    peer_id_to_connect: String, // For UI to connect to specific peer
 }
 
 #[derive(PartialEq, Clone)]
@@ -98,18 +87,16 @@ enum Mode {
 }
 
 enum Msg {
-    PeerMessage(String, WsMessage), // peer_id, message
-    PeerConnected(String, DataConnection), // peer_id, connection
-    PeerInitialized(Peer),
+    WsMessage(WsMessage),
+    WsConnected,
+    WsClosed,
+    WsError(String),
     UpdateField(&'static str, String),
     ToggleMode,
     SendSync,
     InitTinyMCE,
     SyncBodyFromTinyMCE,
-    SetEditing(Option<String>), // field name or None to stop editing
-    ConnectToPeer,
-    UpdatePeerIdInput(String),
-    CopyPeerId,
+    SetEditing(Option<String>),
 }
 
 impl Component for App {
@@ -117,216 +104,121 @@ impl Component for App {
     type Properties = ();
 
     fn create(ctx: &Context<Self>) -> Self {
-        let link = ctx.link().clone();
-        
-        // Initialize PeerJS
-        spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(100).await;
-            
-            // Create peer with random ID
-            let peer = new_peer(None);
-            
-            // Setup "open" event - peer is ready
-            let link_open = link.clone();
-            let peer_js: JsValue = peer.into();
-            let peer_js_clone = peer_js.clone();
-            let on_open = Closure::wrap(Box::new(move |_peer_id: JsValue| {
-                // Get the actual peer from JS and send it
-                let peer_ref: Peer = peer_js_clone.clone().unchecked_into();
-                if let Some(id) = peer_ref.id() {
-                    log_1(&format!("[P2P] Peer initialized with ID: {}", id).into());
-                    link_open.send_message(Msg::PeerInitialized(peer_ref));
-                }
-            }) as Box<dyn FnMut(JsValue)>);
-            
-            let peer_ref: &Peer = peer_js.unchecked_ref();
-            peer_ref.on("open", on_open.as_ref().unchecked_ref());
-            on_open.forget();
-            
-            // Setup "connection" event - incoming peer connection
-            let link_conn = link.clone();
-            let on_connection = Closure::wrap(Box::new(move |conn_js: JsValue| {
-                let conn: DataConnection = conn_js.unchecked_into();
-                let peer_id = conn.peer();
-                log_1(&format!("[P2P] 📥 Incoming connection from: {}", peer_id).into());
-                
-                // Setup data handler for this connection
-                let link_data = link_conn.clone();
-                let peer_id_data = peer_id.clone();
-                let on_data = Closure::wrap(Box::new(move |data: JsValue| {
-                    if let Some(text) = data.as_string() {
-                        log_1(&format!("[P2P] Received from {}: {}", peer_id_data, text).into());
-                        if let Ok(msg) = serde_json::from_str::<WsMessage>(&text) {
-                            link_data.send_message(Msg::PeerMessage(peer_id_data.clone(), msg));
+        // Initialize EMPTY document - server is source of truth
+        let doc = AutoCommit::new();
+        // Don't create initial values here to avoid CRDT conflicts
+        // The first sync from server will populate the document
+
+        // Connect to WebSocket server
+        // For local development: ws://localhost:8787/ws
+        // For Cloudflare: wss://your-worker.workers.dev/ws
+        let ws_url = "ws://localhost:8787/ws";
+
+        let ws = WebSocket::new(ws_url).ok();
+
+        if let Some(ref websocket) = ws {
+            let link = ctx.link().clone();
+
+            // Setup onmessage
+            let link_msg = link.clone();
+            let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
+                if let Some(txt) = e.data().as_string() {
+                    log_1(&format!("[WS] Received: {}", &txt[..txt.len().min(100)]).into());
+                    match serde_json::from_str::<WsMessage>(&txt) {
+                        Ok(msg) => {
+                            log_1(&format!("[WS] Parsed message: {:?}", msg).into());
+                            link_msg.send_message(Msg::WsMessage(msg));
+                        }
+                        Err(e) => {
+                            log_1(&format!("[WS] Failed to parse message: {:?}", e).into());
                         }
                     }
-                }) as Box<dyn FnMut(JsValue)>);
-                
-                conn.on("data", on_data.as_ref().unchecked_ref());
-                on_data.forget();
-                
-                link_conn.send_message(Msg::PeerConnected(peer_id.clone(), conn));
-            }) as Box<dyn FnMut(JsValue)>);
-            peer_ref.on("connection", on_connection.as_ref().unchecked_ref());
-            on_connection.forget();
-            
-            // Setup error handler for peer
-            let on_error = Closure::wrap(Box::new(move |err: JsValue| {
-                log_1(&format!("[P2P] ❌ Peer error: {:?}", err).into());
-            }) as Box<dyn FnMut(JsValue)>);
-            peer_ref.on("error", on_error.as_ref().unchecked_ref());
-            on_error.forget();
-            
-            // Don't send PeerInitialized here - wait for "open" event
-        });
+                }
+            }) as Box<dyn FnMut(MessageEvent)>);
+            websocket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+            onmessage.forget();
 
-        // Initialize document
-        let mut doc = AutoCommit::new();
-        doc.put(automerge::ROOT, DOC_KEY_TITLE, "Untitled").unwrap();
-        doc.put(automerge::ROOT, DOC_KEY_BODY, "").unwrap();
-        doc.put(automerge::ROOT, DOC_KEY_KEYWORDS, "").unwrap();
-        doc.put(automerge::ROOT, DOC_KEY_VERSION, 0u64).unwrap();
+            // Setup onopen
+            let link_open = link.clone();
+            let onopen = Closure::wrap(Box::new(move |_| {
+                log_1(&"[WS] Connected!".into());
+                link_open.send_message(Msg::WsConnected);
+            }) as Box<dyn FnMut(JsValue)>);
+            websocket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+            onopen.forget();
+
+            // Setup onclose
+            let link_close = link.clone();
+            let onclose = Closure::wrap(Box::new(move |_: CloseEvent| {
+                log_1(&"[WS] Disconnected".into());
+                link_close.send_message(Msg::WsClosed);
+            }) as Box<dyn FnMut(CloseEvent)>);
+            websocket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+            onclose.forget();
+
+            // Setup onerror
+            let link_error = link.clone();
+            let onerror = Closure::wrap(Box::new(move |e: ErrorEvent| {
+                log_1(&format!("[WS] Error: {:?}", e.message()).into());
+                link_error.send_message(Msg::WsError(e.message()));
+            }) as Box<dyn FnMut(ErrorEvent)>);
+            websocket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            onerror.forget();
+        } else {
+            log_1(&"[WS] Failed to create WebSocket".into());
+        }
 
         Self {
             doc,
-            sync_states: HashMap::new(),
+            sync_state: sync::State::new(),
             mode: Mode::View,
-            peer: None,
-            connections: HashMap::new(),
+            ws,
             tinymce_initialized: false,
             users: HashMap::new(),
             my_id: None,
             my_name: None,
-            peer_id_to_connect: String::new(),
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::PeerInitialized(peer) => {
-                let peer_id = peer.id().unwrap_or_else(|| "unknown".to_string());
-                self.my_id = Some(peer_id.clone());
-                self.my_name = Some(peer_id.clone());
-                
-                // Add self to users list
-                self.users.insert(peer_id.clone(), UserState {
-                    user_id: peer_id.clone(),
-                    user_name: peer_id,
-                    editing: false,
-                    field: None,
-                    online: true,
-                });
-                
-                self.peer = Some(peer);
-                log_1(&format!("[P2P] My peer ID: {}", self.my_id.as_ref().unwrap()).into());
-                true
-            }
-            Msg::PeerConnected(peer_id, conn) => {
-                log_1(&format!("[P2P] Peer connected: {}", peer_id).into());
-                self.connections.insert(peer_id.clone(), conn);
-                self.sync_states.insert(peer_id.clone(), sync::State::new());
-                
-                // Add the remote peer to users list immediately
-                self.users.insert(peer_id.clone(), UserState {
-                    user_id: peer_id.clone(),
-                    user_name: peer_id.clone(),
-                    editing: false,
-                    field: None,
-                    online: true,
-                });
-                
-                // Send initial sync to new peer
-                ctx.link().send_message(Msg::SendSync);
-                
-                // Send our user state to new peer
-                if let Some(my_id) = &self.my_id {
-                    if let Some(my_state) = self.users.get(my_id) {
-                        self.broadcast_user_state(my_state.clone());
-                    }
-                }
-                true
-            }
-            Msg::PeerMessage(peer_id, ws_msg) => {
+            Msg::WsMessage(ws_msg) => {
                 match ws_msg {
-                    WsMessage::Welcome(_) => false, // Not used in P2P
-                    WsMessage::Sync(binary) => self.handle_sync_from_peer(ctx, &peer_id, binary),
-                    WsMessage::UserState(user_state) => self.handle_user_state(user_state),
-                }
-            }
-            Msg::ConnectToPeer => {
-                if let Some(peer) = &self.peer {
-                    let remote_peer_id = self.peer_id_to_connect.trim().to_string();
-                    if !remote_peer_id.is_empty() && !self.connections.contains_key(&remote_peer_id) {
-                        log_1(&format!("[P2P] Attempting to connect to peer: {}", remote_peer_id).into());
-                        
-                        let conn = peer.connect(&remote_peer_id);
-                        
-                        // Setup data handler
-                        let link = ctx.link().clone();
-                        let peer_id_clone = remote_peer_id.clone();
-                        let on_data = Closure::wrap(Box::new(move |data: JsValue| {
-                            if let Some(text) = data.as_string() {
-                                log_1(&format!("[P2P] Received from {}: {}", peer_id_clone, text).into());
-                                if let Ok(msg) = serde_json::from_str::<WsMessage>(&text) {
-                                    link.send_message(Msg::PeerMessage(peer_id_clone.clone(), msg));
-                                }
-                            }
-                        }) as Box<dyn FnMut(JsValue)>);
-                        
-                        conn.on("data", on_data.as_ref().unchecked_ref());
-                        on_data.forget();
-                        
-                        // Setup open handler
-                        let link_open = ctx.link().clone();
-                        let peer_id_open = remote_peer_id.clone();
-                        let conn_js: JsValue = conn.into();
-                        let conn_js_clone = conn_js.clone();
-                        let conn_js_clone2 = conn_js.clone();
-                        
-                        let on_open = Closure::wrap(Box::new(move || {
-                            log_1(&format!("[P2P] ✅ Connection established to {}", peer_id_open).into());
-                            let conn_ref: DataConnection = conn_js_clone.clone().unchecked_into();
-                            link_open.send_message(Msg::PeerConnected(peer_id_open.clone(), conn_ref));
-                        }) as Box<dyn Fn()>);
-                        
-                        // Setup error handler
-                        let peer_id_error = remote_peer_id.clone();
-                        let on_error = Closure::wrap(Box::new(move |err: JsValue| {
-                            log_1(&format!("[P2P] ❌ Connection error to {}: {:?}", peer_id_error, err).into());
-                        }) as Box<dyn FnMut(JsValue)>);
-                        
-                        // Setup close handler
-                        let peer_id_close = remote_peer_id.clone();
-                        let on_close = Closure::wrap(Box::new(move || {
-                            log_1(&format!("[P2P] 🔌 Connection closed to {}", peer_id_close).into());
-                        }) as Box<dyn Fn()>);
-                        
-                        let conn_ref: &DataConnection = conn_js_clone2.unchecked_ref();
-                        conn_ref.on("open", on_open.as_ref().unchecked_ref());
-                        conn_ref.on("error", on_error.as_ref().unchecked_ref());
-                        conn_ref.on("close", on_close.as_ref().unchecked_ref());
-                        
-                        on_open.forget();
-                        on_error.forget();
-                        on_close.forget();
-                    } else if remote_peer_id.is_empty() {
-                        log_1(&"[P2P] ⚠️ Please enter a peer ID to connect".into());
-                    } else {
-                        log_1(&format!("[P2P] ⚠️ Already connected to {}", remote_peer_id).into());
+                    WsMessage::Welcome(user_id) => {
+                        log_1(&format!("[WS] Welcome! My ID: {}", user_id).into());
+                        self.my_id = Some(user_id.clone());
+                        self.my_name = Some(user_id.clone());
+
+                        // Add self to users list
+                        self.users.insert(user_id.clone(), UserState {
+                            user_id: user_id.clone(),
+                            user_name: user_id,
+                            editing: false,
+                            field: None,
+                            online: true,
+                        });
+                        true
+                    }
+                    WsMessage::Sync(binary) => {
+                        log_1(&format!("[WS] Received Sync message, {} bytes", binary.len()).into());
+                        self.handle_sync_from_server(ctx, binary)
+                    }
+                    WsMessage::UserState(user_state) => {
+                        self.handle_user_state(user_state)
                     }
                 }
-                false
             }
-            Msg::UpdatePeerIdInput(value) => {
-                self.peer_id_to_connect = value;
-                false
+            Msg::WsConnected => {
+                log_1(&"[WS] WebSocket connected!".into());
+                true
             }
-            Msg::CopyPeerId => {
-                if let Some(peer_id) = self.my_id.clone() {
-                    spawn_local(async move {
-                        let _ = copy_to_clipboard(&peer_id).await;
-                    });
-                }
+            Msg::WsClosed => {
+                log_1(&"[WS] WebSocket closed".into());
+                self.ws = None;
+                true
+            }
+            Msg::WsError(err) => {
+                log_1(&format!("[WS] WebSocket error: {}", err).into());
                 false
             }
             Msg::UpdateField(key, value) => {
@@ -393,12 +285,12 @@ impl Component for App {
             }
             Msg::SetEditing(field) => {
                 log_1(&format!(
-                    "[P2P] SetEditing called with field={:?}",
+                    "[WS] SetEditing called with field={:?}",
                     field
                 ).into());
-                
-                // Update our own state locally and get a copy to broadcast
-                let state_to_broadcast = if let Some(my_id) = &self.my_id {
+
+                // Update our own state locally and prepare to send
+                let state_to_send = if let Some(my_id) = &self.my_id {
                     if let Some(my_state) = self.users.get_mut(my_id) {
                         my_state.editing = field.is_some();
                         my_state.field = field.clone();
@@ -409,24 +301,29 @@ impl Component for App {
                 } else {
                     None
                 };
-                
-                // Broadcast to all peers
-                if let Some(state) = state_to_broadcast {
-                    self.broadcast_user_state(state);
+
+                // Send to server after mutable borrow is dropped
+                if let Some(state) = state_to_send {
+                    self.send_user_state(state);
                 }
                 true
             }
             Msg::SendSync => {
-                // Send sync message to all connected peers
-                for (peer_id, conn) in &self.connections {
-                    if let Some(sync_state) = self.sync_states.get_mut(peer_id) {
-                        if let Some(msg) = self.doc.sync().generate_sync_message(sync_state) {
-                            let ws_msg = WsMessage::Sync(msg.encode());
-                            if let Ok(json) = serde_json::to_string(&ws_msg) {
-                                conn.send(&json);
-                            }
+                // Send sync message to server
+                if let Some(ws) = &self.ws {
+                    if let Some(msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
+                        let encoded = msg.encode();
+                        log_1(&format!("[WS] Sending Sync message, {} bytes", encoded.len()).into());
+                        let ws_msg = WsMessage::Sync(encoded);
+                        if let Ok(json) = serde_json::to_string(&ws_msg) {
+                            log_1(&format!("[WS] JSON to send: {}", &json[..json.len().min(200)]).into());
+                            let _ = ws.send_with_str(&json);
                         }
+                    } else {
+                        log_1(&"[WS] No sync message to send".into());
                     }
+                } else {
+                    log_1(&"[WS] No WebSocket connection!".into());
                 }
                 false
             }
@@ -438,6 +335,9 @@ impl Component for App {
         let keywords = self.get_str(DOC_KEY_KEYWORDS);
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
+
+        log_1(&format!("[VIEW] Rendering - title: '{}', keywords: '{}', body: '{}', version: {}",
+            title, keywords, &body[..body.len().min(50)], version).into());
 
         // Get OTHER users editing each field (exclude self)
         let my_id = self.my_id.as_deref();
@@ -455,43 +355,15 @@ impl Component for App {
             <div>
                 <header>
                     <hgroup>
-                        <h1>{ "WebRTC Collaborative Editor" }</h1>
+                        <h1>{ "Collaborative Editor" }</h1>
                         <p>{ format!("v{}", version) }</p>
                     </hgroup>
 
-                    // P2P Connection Info - only show when not connected
-                    if self.connections.is_empty() {
-                        <article>
-                            <label>{"Your Peer ID"}</label>
-                            <fieldset role="group">
-                                <input
-                                    type="text"
-                                    value={self.my_id.clone().unwrap_or_else(|| "Initializing...".to_string())}
-                                    readonly=true
-                                />
-                                <button type="button" onclick={ctx.link().callback(|_| Msg::CopyPeerId)}>
-                                    {"Copy"}
-                                </button>
-                            </fieldset>
-
-                            <label>{"Connect to Peer"}</label>
-                            <fieldset role="group">
-                                <input
-                                    type="text"
-                                    placeholder="Enter peer ID to connect"
-                                    value={self.peer_id_to_connect.clone()}
-                                    oninput={ctx.link().callback(|e: InputEvent| {
-                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdatePeerIdInput(input.value())
-                                    })}
-                                />
-                                <button type="button" onclick={ctx.link().callback(|_| Msg::ConnectToPeer)}>
-                                    {"Connect"}
-                                </button>
-                            </fieldset>
-                        </article>
+                    // Connection status
+                    if self.ws.is_some() {
+                        <p><mark>{ format!("Connected - {} user(s)", self.users.len()) }</mark></p>
                     } else {
-                        <p><mark>{"Connected to "}{ self.connections.len() }{ " peer(s)" }</mark></p>
+                        <p>{"Connecting to server..."}</p>
                     }
 
                     // Online users
@@ -508,15 +380,7 @@ impl Component for App {
                     </div>
                 </header>
 
-                if self.users.len() < 2 {
-                    <article>
-                        <hgroup>
-                            <h2>{"Waiting for collaborators..."}</h2>
-                            <p>{"Share your Peer ID above with others to start collaborating."}</p>
-                        </hgroup>
-                        <p><small>{"The editor will become available once another peer connects."}</small></p>
-                    </article>
-                } else if self.mode == Mode::View {
+                if self.mode == Mode::View {
                     <article class="view-mode">
                         <header>
                             <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
@@ -644,21 +508,26 @@ impl App {
             .map(|(v, _)| match v {
                 automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Uint(u))) => u,
                 automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Uint(u))) => *u,
+                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Int(i))) => i as u64,
+                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Int(i))) => *i as u64,
+                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::F64(f))) => f as u64,
+                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::F64(f))) => *f as u64,
                 _ => 0,
             })
             .unwrap_or(0)
     }
 
-    fn handle_sync_from_peer(&mut self, _ctx: &Context<Self>, peer_id: &str, binary: Vec<u8>) -> bool {
+    fn handle_sync_from_server(&mut self, _ctx: &Context<Self>, binary: Vec<u8>) -> bool {
+        log_1(&format!("[SYNC] Processing sync message, {} bytes", binary.len()).into());
         if let Ok(sync_msg) = sync::Message::decode(&binary) {
             let heads_before = self.doc.get_heads();
-            
-            // Get or create sync state for this peer
-            let sync_state = self.sync_states.entry(peer_id.to_string()).or_insert_with(sync::State::new);
-            
-            self.doc.sync().receive_sync_message(sync_state, sync_msg).unwrap();
+            log_1(&format!("[SYNC] Heads before: {:?}", heads_before).into());
+
+            // Use single sync state for server connection
+            self.doc.sync().receive_sync_message(&mut self.sync_state, sync_msg).unwrap();
             let heads_after = self.doc.get_heads();
-            
+            log_1(&format!("[SYNC] Heads after: {:?}, changed: {}", heads_after, heads_before != heads_after).into());
+
             // Update TinyMCE if body changed from remote and we're in edit mode
             if heads_before != heads_after && self.tinymce_initialized {
                 if let Some(editor) = get("body-editor") {
@@ -693,31 +562,32 @@ impl App {
                     }
                 }
             }
-            
-            // Send sync response back to this specific peer
-            if let Some(conn) = self.connections.get(peer_id) {
-                // Need to get sync_state again to avoid multiple mutable borrows
-                if let Some(sync_state) = self.sync_states.get_mut(peer_id) {
-                    if let Some(reply_msg) = self.doc.sync().generate_sync_message(sync_state) {
-                        let ws_msg = WsMessage::Sync(reply_msg.encode());
-                        if let Ok(json) = serde_json::to_string(&ws_msg) {
-                            conn.send(&json);
-                        }
+
+            // Send sync response back to server
+            if let Some(ws) = &self.ws {
+                if let Some(reply_msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
+                    log_1(&"[SYNC] Sending sync reply to server".into());
+                    let ws_msg = WsMessage::Sync(reply_msg.encode());
+                    if let Ok(json) = serde_json::to_string(&ws_msg) {
+                        let _ = ws.send_with_str(&json);
                     }
+                } else {
+                    log_1(&"[SYNC] No reply needed".into());
                 }
             }
-            
+
             true
         } else {
+            log_1(&"[SYNC] Failed to decode sync message!".into());
             false
         }
     }
     
-    fn broadcast_user_state(&self, user_state: UserState) {
+    fn send_user_state(&self, user_state: UserState) {
         let ws_msg = WsMessage::UserState(user_state);
         if let Ok(json) = serde_json::to_string(&ws_msg) {
-            for conn in self.connections.values() {
-                conn.send(&json);
+            if let Some(ws) = &self.ws {
+                let _ = ws.send_with_str(&json);
             }
         }
     }
