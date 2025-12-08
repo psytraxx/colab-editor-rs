@@ -23,12 +23,23 @@ extern "C" {
     fn remove(selector: &str);
     
     type TinyMCEEditor;
-    
+
     #[wasm_bindgen(method, js_name = getContent)]
     fn get_content(this: &TinyMCEEditor) -> String;
-    
+
     #[wasm_bindgen(method, js_name = setContent)]
     fn set_content(this: &TinyMCEEditor, content: &str);
+
+    #[wasm_bindgen(method, getter)]
+    fn selection(this: &TinyMCEEditor) -> TinyMCESelection;
+
+    type TinyMCESelection;
+
+    #[wasm_bindgen(method, js_name = getBookmark)]
+    fn get_bookmark(this: &TinyMCESelection, bookmark_type: i32) -> JsValue;
+
+    #[wasm_bindgen(method, js_name = moveToBookmark)]
+    fn move_to_bookmark(this: &TinyMCESelection, bookmark: &JsValue);
 }
 
 // PeerJS bindings
@@ -650,7 +661,16 @@ impl App {
                         .unwrap_or_default();
                     let current_content = editor.get_content();
                     if new_body != current_content {
+                        // Save cursor position before updating content
+                        let selection = editor.selection();
+                        let bookmark = selection.get_bookmark(2); // Type 2 = simple bookmark
+
+                        // Apply remote content
                         editor.set_content(&new_body);
+
+                        // Restore cursor position
+                        let selection = editor.selection();
+                        selection.move_to_bookmark(&bookmark);
                     }
                 }
             }
