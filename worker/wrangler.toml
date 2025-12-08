@@ -10,4 +10,4 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["EditorRoom"]
+new_sqlite_classes = ["EditorRoom"]
