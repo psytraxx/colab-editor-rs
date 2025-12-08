@@ -33,6 +33,7 @@ struct UserState {
     user_id: String,
     user_name: String,
     online: bool,
+    editing: bool,
 }
 
 #[wasm_bindgen]
@@ -219,6 +220,7 @@ impl Component for App {
                             user_id: user_id.clone(),
                             user_name: user_id,
                             online: true,
+                            editing: false,
                         });
                         
                         true
@@ -298,6 +300,14 @@ impl Component for App {
                     Mode::View => {
                         // Initialize TinyMCE after switching to edit mode
                         ctx.link().send_message(Msg::InitTinyMCE);
+                        // Broadcast that we're entering edit mode
+                        self.broadcast_my_state(true);
+                        // Update our own user state
+                        if let Some(my_id) = &self.my_id {
+                            if let Some(user) = self.users.get_mut(my_id) {
+                                user.editing = true;
+                            }
+                        }
                         Mode::Edit
                     }
                     Mode::Edit => {
@@ -315,6 +325,14 @@ impl Component for App {
                             }
                             remove("#body-editor");
                             self.tinymce_initialized = false;
+                        }
+                        // Broadcast that we're leaving edit mode
+                        self.broadcast_my_state(false);
+                        // Update our own user state
+                        if let Some(my_id) = &self.my_id {
+                            if let Some(user) = self.users.get_mut(my_id) {
+                                user.editing = false;
+                            }
                         }
                         Mode::View
                     }
@@ -382,8 +400,13 @@ impl Component for App {
                     // Online users
                     <div class="online-users">
                         { for self.users.values().map(|user| {
+                            let class = if user.editing {
+                                "user-badge editing"
+                            } else {
+                                "user-badge inactive"
+                            };
                             html! {
-                                <span class="user-badge inactive">
+                                <span class={class}>
                                     { &user.user_name }
                                 </span>
                             }
@@ -509,6 +532,21 @@ impl App {
         ).into());
         
         true
+    }
+
+    fn broadcast_my_state(&self, editing: bool) {
+        if let (Some(my_id), Some(my_name), Some(ws)) = (&self.my_id, &self.my_name, &self.ws) {
+            let user_state = UserState {
+                user_id: my_id.clone(),
+                user_name: my_name.clone(),
+                online: true,
+                editing,
+            };
+            let ws_msg = WsMessage::UserState(user_state);
+            if let Ok(json) = serde_json::to_string(&ws_msg) {
+                let _ = ws.send_with_str(&json);
+            }
+        }
     }
 
     fn init_tinymce(&mut self, ctx: &Context<Self>) {

@@ -82,7 +82,8 @@ export class EditorRoom {
     const userState: UserState = {
       user_id: userId,
       user_name: userName,
-      online: true
+      online: true,
+      editing: false
     };
     this.users.set(userId, userState);
 
@@ -150,11 +151,12 @@ export class EditorRoom {
   }
 
   private handleUserState(session: Session, incomingState: UserState): void {
-    // Update user state
+    // Update user state with editing flag from incoming state
     const userState: UserState = {
       user_id: session.userId,
       user_name: session.userName,
-      online: true
+      online: true,
+      editing: incomingState.editing ?? false
     };
 
     this.users.set(session.userId, userState);
@@ -207,4 +209,5 @@ interface UserState {
   user_id: string;
   user_name: string;
   online: boolean;
+  editing: boolean;
 }
