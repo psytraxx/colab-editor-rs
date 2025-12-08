@@ -2,9 +2,8 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Colab Editor - P2P</title>
+    <title>Collaborative Editor</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <script src="tinymce/tinymce.min.js"></script>
     <link data-trunk rel="copy-dir" href="static/tinymce" />
     <style>
@@ -52,6 +51,11 @@
         border: 1px solid #ddd;
       }
       .user-badge.active {
+        background-color: #4caf50;
+        color: white;
+        border-color: #4caf50;
+      }
+      .user-badge.editing {
         background-color: #4caf50;
         color: white;
         border-color: #4caf50;

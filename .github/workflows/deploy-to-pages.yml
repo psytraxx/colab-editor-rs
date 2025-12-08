@@ -1,4 +1,4 @@
-name: Deploy P2P Editor to GitHub Pages
+name: Deploy Collaborative Editor to GitHub Pages
 
 on:
   push:
