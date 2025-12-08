@@ -1,5 +1,4 @@
 use automerge::{
-    sync::{self, SyncDoc},
     transaction::Transactable,
     AutoCommit, ReadDoc,
 };
@@ -20,8 +19,12 @@ const DOC_KEY_VERSION: &str = "version";
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 enum WsMessage {
-    Welcome(String),
-    Sync(Vec<u8>),
+    Init {
+        user_id: String,
+        snapshot: Option<Vec<u8>>,
+        users: Vec<UserState>,
+    },
+    Content(Vec<u8>),
     UserState(UserState),
 }
 
@@ -29,8 +32,6 @@ enum WsMessage {
 struct UserState {
     user_id: String,
     user_name: String,
-    editing: bool,
-    field: Option<String>,
     online: bool,
 }
 
@@ -71,7 +72,6 @@ extern "C" {
 
 struct App {
     doc: AutoCommit,
-    sync_state: sync::State,  // Single sync state for server
     mode: Mode,
     ws: Option<WebSocket>,
     tinymce_initialized: bool,
@@ -93,10 +93,9 @@ enum Msg {
     WsError(String),
     UpdateField(&'static str, String),
     ToggleMode,
-    SendSync,
+    LocalUpdate,
     InitTinyMCE,
     SyncBodyFromTinyMCE,
-    SetEditing(Option<String>),
 }
 
 impl Component for App {
@@ -106,8 +105,6 @@ impl Component for App {
     fn create(ctx: &Context<Self>) -> Self {
         // Initialize EMPTY document - server is source of truth
         let doc = AutoCommit::new();
-        // Don't create initial values here to avoid CRDT conflicts
-        // The first sync from server will populate the document
 
         // Connect to WebSocket server
         // For local development: ws://localhost:8787/ws
@@ -123,10 +120,16 @@ impl Component for App {
             let link_msg = link.clone();
             let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
                 if let Some(txt) = e.data().as_string() {
-                    log_1(&format!("[WS] Received: {}", &txt[..txt.len().min(100)]).into());
+                    // Log abbreviated message to avoid console spam with large snapshots
+                    let log_txt = if txt.len() > 100 {
+                        format!("{}...", &txt[..100])
+                    } else {
+                        txt.clone()
+                    };
+                    log_1(&format!("[WS] Received: {}", log_txt).into());
+                    
                     match serde_json::from_str::<WsMessage>(&txt) {
                         Ok(msg) => {
-                            log_1(&format!("[WS] Parsed message: {:?}", msg).into());
                             link_msg.send_message(Msg::WsMessage(msg));
                         }
                         Err(e) => {
@@ -170,7 +173,6 @@ impl Component for App {
 
         Self {
             doc,
-            sync_state: sync::State::new(),
             mode: Mode::View,
             ws,
             tinymce_initialized: false,
@@ -184,24 +186,80 @@ impl Component for App {
         match msg {
             Msg::WsMessage(ws_msg) => {
                 match ws_msg {
-                    WsMessage::Welcome(user_id) => {
-                        log_1(&format!("[WS] Welcome! My ID: {}", user_id).into());
+                    WsMessage::Init { user_id, snapshot, users } => {
+                        log_1(&format!("[WS] Init! My ID: {}", user_id).into());
                         self.my_id = Some(user_id.clone());
                         self.my_name = Some(user_id.clone());
 
-                        // Add self to users list
+                        // Load snapshot if present
+                        if let Some(data) = snapshot {
+                             if let Ok(doc) = AutoCommit::load(&data) {
+                                 self.doc = doc;
+                                 if self.tinymce_initialized {
+                                     if let Some(editor) = get("body-editor") {
+                                         let body = self.get_str(DOC_KEY_BODY);
+                                         editor.set_content(&body);
+                                     }
+                                 }
+                             } else {
+                                 log_1(&"[WS] Failed to load snapshot".into());
+                             }
+                        }
+
+                        // Populate users
+                        self.users.clear();
+                        for user in users {
+                            if user.online {
+                                self.users.insert(user.user_id.clone(), user);
+                            }
+                        }
+                        
+                        // Add self to users list (if not in list from server)
                         self.users.insert(user_id.clone(), UserState {
                             user_id: user_id.clone(),
                             user_name: user_id,
-                            editing: false,
-                            field: None,
                             online: true,
                         });
+                        
                         true
                     }
-                    WsMessage::Sync(binary) => {
-                        log_1(&format!("[WS] Received Sync message, {} bytes", binary.len()).into());
-                        self.handle_sync_from_server(ctx, binary)
+                    WsMessage::Content(data) => {
+                        log_1(&format!("[WS] Received Content update, {} bytes", data.len()).into());
+                        if let Ok(mut remote_doc) = AutoCommit::load(&data) {
+                            let body_before = self.get_str(DOC_KEY_BODY);
+                            
+                            // Merge remote state into local
+                            if let Err(e) = self.doc.merge(&mut remote_doc) {
+                                log_1(&format!("[WS] Merge failed: {:?}", e).into());
+                                return false;
+                            }
+                            
+                            let body_after = self.get_str(DOC_KEY_BODY);
+
+                            // Update TinyMCE if body changed from remote and we're in edit mode
+                            if body_before != body_after && self.tinymce_initialized {
+                                if let Some(editor) = get("body-editor") {
+                                    let current_content = editor.get_content();
+                                    if body_after != current_content {
+                                        if editor.has_focus() {
+                                            // Save cursor position before updating content
+                                            let selection = editor.selection();
+                                            let bookmark = selection.get_bookmark(2);
+                                            editor.set_content(&body_after);
+                                            // Restore cursor position
+                                            let selection = editor.selection();
+                                            selection.move_to_bookmark(&bookmark);
+                                        } else {
+                                            editor.set_content(&body_after);
+                                        }
+                                    }
+                                }
+                            }
+                            true
+                        } else {
+                            log_1(&"[WS] Failed to load remote content".into());
+                            false
+                        }
                     }
                     WsMessage::UserState(user_state) => {
                         self.handle_user_state(user_state)
@@ -229,7 +287,7 @@ impl Component for App {
                     // Increment version only when content actually changes
                     let current_version = self.get_u64(DOC_KEY_VERSION);
                     self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                    ctx.link().send_message(Msg::SendSync);
+                    ctx.link().send_message(Msg::LocalUpdate);
                     true
                 } else {
                     false
@@ -240,7 +298,6 @@ impl Component for App {
                     Mode::View => {
                         // Initialize TinyMCE after switching to edit mode
                         ctx.link().send_message(Msg::InitTinyMCE);
-                        ctx.link().send_message(Msg::SetEditing(Some("general".to_string())));
                         Mode::Edit
                     }
                     Mode::Edit => {
@@ -253,14 +310,12 @@ impl Component for App {
                                     self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
                                     let current_version = self.get_u64(DOC_KEY_VERSION);
                                     self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                                    ctx.link().send_message(Msg::SendSync);
+                                    ctx.link().send_message(Msg::LocalUpdate);
                                 }
                             }
                             remove("#body-editor");
                             self.tinymce_initialized = false;
                         }
-                        // Signal we stopped editing
-                        ctx.link().send_message(Msg::SetEditing(None));
                         Mode::View
                     }
                 };
@@ -278,49 +333,19 @@ impl Component for App {
                         self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
                         let current_version = self.get_u64(DOC_KEY_VERSION);
                         self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                        ctx.link().send_message(Msg::SendSync);
+                        ctx.link().send_message(Msg::LocalUpdate);
                     }
                 }
                 false
             }
-            Msg::SetEditing(field) => {
-                log_1(&format!(
-                    "[WS] SetEditing called with field={:?}",
-                    field
-                ).into());
-
-                // Update our own state locally and prepare to send
-                let state_to_send = if let Some(my_id) = &self.my_id {
-                    if let Some(my_state) = self.users.get_mut(my_id) {
-                        my_state.editing = field.is_some();
-                        my_state.field = field.clone();
-                        Some(my_state.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Send to server after mutable borrow is dropped
-                if let Some(state) = state_to_send {
-                    self.send_user_state(state);
-                }
-                true
-            }
-            Msg::SendSync => {
-                // Send sync message to server
+            Msg::LocalUpdate => {
+                // Send FULL content (state-based sync)
                 if let Some(ws) = &self.ws {
-                    if let Some(msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
-                        let encoded = msg.encode();
-                        log_1(&format!("[WS] Sending Sync message, {} bytes", encoded.len()).into());
-                        let ws_msg = WsMessage::Sync(encoded);
-                        if let Ok(json) = serde_json::to_string(&ws_msg) {
-                            log_1(&format!("[WS] JSON to send: {}", &json[..json.len().min(200)]).into());
-                            let _ = ws.send_with_str(&json);
-                        }
-                    } else {
-                        log_1(&"[WS] No sync message to send".into());
+                    let data = self.doc.save();
+                    log_1(&format!("[WS] Sending Content update, {} bytes", data.len()).into());
+                    let ws_msg = WsMessage::Content(data);
+                    if let Ok(json) = serde_json::to_string(&ws_msg) {
+                        let _ = ws.send_with_str(&json);
                     }
                 } else {
                     log_1(&"[WS] No WebSocket connection!".into());
@@ -336,20 +361,8 @@ impl Component for App {
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
 
-        log_1(&format!("[VIEW] Rendering - title: '{}', keywords: '{}', body: '{}', version: {}",
-            title, keywords, &body[..body.len().min(50)], version).into());
-
-        // Get OTHER users editing each field (exclude self)
-        let my_id = self.my_id.as_deref();
-        let title_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("title") && Some(u.user_id.as_str()) != my_id)
-            .collect();
-        let keywords_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("keywords") && Some(u.user_id.as_str()) != my_id)
-            .collect();
-        let body_editors: Vec<_> = self.users.values()
-            .filter(|u| u.editing && u.field.as_deref() == Some("body") && Some(u.user_id.as_str()) != my_id)
-            .collect();
+        // log_1(&format!("[VIEW] Rendering - title: '{}', keywords: '{}', body: '{}', version: {}",
+        //    title, keywords, &body[..body.len().min(50)], version).into());
 
         html! {
             <div>
@@ -370,9 +383,7 @@ impl Component for App {
                     <div class="online-users">
                         { for self.users.values().map(|user| {
                             html! {
-                                <span
-                                    class={format!("user-badge {}", if user.editing { "active" } else { "inactive" })}
-                                >
+                                <span class="user-badge inactive">
                                     { &user.user_name }
                                 </span>
                             }
@@ -401,20 +412,7 @@ impl Component for App {
                         </header>
                         
                         <div class="field">
-                            <label>
-                                { "Title" }
-                                { if !title_editors.is_empty() {
-                                    html! {
-                                        <small>
-                                            {" (editing: "}
-                                            { for title_editors.iter().map(|user| html! { { &user.user_name } }) }
-                                            {")"}
-                                        </small>
-                                    }
-                                } else {
-                                    html! {}
-                                }}
-                            </label>
+                            <label>{ "Title" }</label>
                             <input
                                 key="title"
                                 type="text"
@@ -423,26 +421,11 @@ impl Component for App {
                                     let input: web_sys::HtmlInputElement = e.target_unchecked_into();
                                     Msg::UpdateField(DOC_KEY_TITLE, input.value())
                                 })}
-                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string()))) }
-                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
                             />
                         </div>
 
                         <div class="field">
-                            <label>
-                                { "Keywords" }
-                                { if !keywords_editors.is_empty() {
-                                    html! {
-                                        <small>
-                                            {" (editing: "}
-                                            { for keywords_editors.iter().map(|user| html! { { &user.user_name } }) }
-                                            {")"}
-                                        </small>
-                                    }
-                                } else {
-                                    html! {}
-                                }}
-                            </label>
+                            <label>{ "Keywords" }</label>
                             <input
                                 key="keywords"
                                 type="text"
@@ -451,31 +434,14 @@ impl Component for App {
                                     let input: web_sys::HtmlInputElement = e.target_unchecked_into();
                                     Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
                                 })}
-                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string()))) }
-                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
                             />
                         </div>
 
                         <div class="field">
-                            <label>
-                                { "Body" }
-                                { if !body_editors.is_empty() {
-                                    html! {
-                                        <small>
-                                            {" (editing: "}
-                                            { for body_editors.iter().map(|user| html! { { &user.user_name } }) }
-                                            {")"}
-                                        </small>
-                                    }
-                                } else {
-                                    html! {}
-                                }}
-                            </label>
+                            <label>{ "Body" }</label>
                             <div
                                 id="body-editor"
                                 class="inline-editor"
-                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
-                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
                             ></div>
                         </div>
                     </article>
@@ -517,86 +483,10 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn handle_sync_from_server(&mut self, _ctx: &Context<Self>, binary: Vec<u8>) -> bool {
-        log_1(&format!("[SYNC] Processing sync message, {} bytes", binary.len()).into());
-        if let Ok(sync_msg) = sync::Message::decode(&binary) {
-            let heads_before = self.doc.get_heads();
-            log_1(&format!("[SYNC] Heads before: {:?}", heads_before).into());
-
-            // Use single sync state for server connection
-            self.doc.sync().receive_sync_message(&mut self.sync_state, sync_msg).unwrap();
-            let heads_after = self.doc.get_heads();
-            log_1(&format!("[SYNC] Heads after: {:?}, changed: {}", heads_after, heads_before != heads_after).into());
-
-            // Update TinyMCE if body changed from remote and we're in edit mode
-            if heads_before != heads_after && self.tinymce_initialized {
-                if let Some(editor) = get("body-editor") {
-                    let new_body = self.doc.get(automerge::ROOT, DOC_KEY_BODY)
-                        .ok()
-                        .flatten()
-                        .and_then(|(v, _)| match v {
-                            automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Str(s))) => Some(s.into()),
-                            automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Str(s))) => Some(s.to_string()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    let current_content = editor.get_content();
-                    if new_body != current_content {
-                        // Only save/restore cursor if the body editor currently has focus
-                        // If user is editing another field (title/keywords), don't interfere
-                        if editor.has_focus() {
-                            // Save cursor position before updating content
-                            let selection = editor.selection();
-                            let bookmark = selection.get_bookmark(2); // Type 2 = simple bookmark
-
-                            // Apply remote content
-                            editor.set_content(&new_body);
-
-                            // Restore cursor position
-                            let selection = editor.selection();
-                            selection.move_to_bookmark(&bookmark);
-                        } else {
-                            // Just update content without touching cursor/focus
-                            editor.set_content(&new_body);
-                        }
-                    }
-                }
-            }
-
-            // Send sync response back to server
-            if let Some(ws) = &self.ws {
-                if let Some(reply_msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
-                    log_1(&"[SYNC] Sending sync reply to server".into());
-                    let ws_msg = WsMessage::Sync(reply_msg.encode());
-                    if let Ok(json) = serde_json::to_string(&ws_msg) {
-                        let _ = ws.send_with_str(&json);
-                    }
-                } else {
-                    log_1(&"[SYNC] No reply needed".into());
-                }
-            }
-
-            true
-        } else {
-            log_1(&"[SYNC] Failed to decode sync message!".into());
-            false
-        }
-    }
-    
-    fn send_user_state(&self, user_state: UserState) {
-        let ws_msg = WsMessage::UserState(user_state);
-        if let Ok(json) = serde_json::to_string(&ws_msg) {
-            if let Some(ws) = &self.ws {
-                let _ = ws.send_with_str(&json);
-            }
-        }
-    }
-
     fn handle_user_state(&mut self, user_state: UserState) -> bool {
         log_1(&format!(
-            "[CLIENT] Received UserState: id={} name={} editing={} field={:?} online={}",
-            user_state.user_id, user_state.user_name, user_state.editing, 
-            user_state.field, user_state.online
+            "[CLIENT] Received UserState: id={} name={} online={}",
+            user_state.user_id, user_state.user_name, user_state.online
         ).into());
         
         // Don't overwrite our own state from server - we manage it locally

@@ -31,11 +31,22 @@ export class EditorRoom {
   private state: DurableObjectState;
   private sessions: Map<WebSocket, Session>;
   private users: Map<string, UserState>;
+  private snapshot: Uint8Array | null;
 
   constructor(state: DurableObjectState) {
     this.state = state;
     this.sessions = new Map();
     this.users = new Map();
+    this.snapshot = null;
+  }
+
+  async loadSnapshot(): Promise<void> {
+    if (this.snapshot) return;
+    const stored = await this.state.storage.get<Uint8Array>('document');
+    if (stored) {
+      this.snapshot = stored;
+      console.log('Loaded snapshot from storage');
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -44,6 +55,9 @@ export class EditorRoom {
     if (upgradeHeader !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
+
+    // Load snapshot if available
+    await this.loadSnapshot();
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -68,23 +82,18 @@ export class EditorRoom {
     const userState: UserState = {
       user_id: userId,
       user_name: userName,
-      editing: false,
-      field: null,
       online: true
     };
     this.users.set(userId, userState);
 
-    // Send Welcome message
+    // Send Init message
     this.send(server, {
-      Welcome: userId
+      Init: {
+        user_id: userId,
+        snapshot: this.snapshot ? Array.from(this.snapshot) : null,
+        users: Array.from(this.users.values())
+      }
     });
-
-    // Send all existing users to new client
-    for (const [uid, user] of this.users.entries()) {
-      this.send(server, {
-        UserState: user
-      });
-    }
 
     // Broadcast new user to others
     this.broadcast({
@@ -105,10 +114,14 @@ export class EditorRoom {
       const data = typeof message === 'string' ? message : new TextDecoder().decode(message);
       const msg = JSON.parse(data);
 
-      if (msg.Sync) {
-        // Relay Sync message to all OTHER clients
-        // We do NOT process it here, just pass it on
-        this.broadcast(msg, ws);
+      if (msg.Content) {
+        // Content = Full Snapshot
+        // 1. Update local state
+        this.snapshot = new Uint8Array(msg.Content);
+        // 2. Persist
+        await this.state.storage.put('document', this.snapshot);
+        // 3. Broadcast to others (exclude sender)
+        this.broadcast({ Content: msg.Content }, ws);
       } else if (msg.UserState) {
         this.handleUserState(session, msg.UserState);
       }
@@ -137,21 +150,19 @@ export class EditorRoom {
   }
 
   private handleUserState(session: Session, incomingState: UserState): void {
-    // Update user state with server-assigned info
+    // Update user state
     const userState: UserState = {
       user_id: session.userId,
       user_name: session.userName,
-      editing: incomingState.editing,
-      field: incomingState.field,
       online: true
     };
 
     this.users.set(session.userId, userState);
 
-    // Broadcast to all clients
+    // Broadcast to all clients (exclude sender)
     this.broadcast({
       UserState: userState
-    });
+    }, session.ws);
   }
 
   private send(ws: WebSocket, message: any): void {
@@ -195,7 +206,5 @@ interface Session {
 interface UserState {
   user_id: string;
   user_name: string;
-  editing: boolean;
-  field: string | null;
   online: boolean;
 }
