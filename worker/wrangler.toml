@@ -1,4 +1,4 @@
-name = "colab-editor-worker"
+name = 'colab-editor-rs'
 main = "src/index.ts"
 compatibility_date = "2024-12-08"
 compatibility_flags = ["nodejs_compat"]
