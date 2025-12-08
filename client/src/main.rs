@@ -108,9 +108,16 @@ impl Component for App {
         let doc = AutoCommit::new();
 
         // Connect to WebSocket server
-        // For local development: ws://localhost:8787/ws
-        // For Cloudflare: wss://your-worker.workers.dev/ws
-        let ws_url = "ws://localhost:8787/ws";
+        // Automatically detect environment
+        let ws_url = if web_sys::window()
+            .and_then(|w| w.location().hostname().ok())
+            .map(|h| h == "localhost" || h == "127.0.0.1")
+            .unwrap_or(false)
+        {
+            "ws://localhost:8787/ws"
+        } else {
+            "wss://colab-editor-rs.dynamicflash.workers.dev/ws"
+        };
 
         let ws = WebSocket::new(ws_url).ok();
 
