@@ -15,13 +15,13 @@ extern "C" {
     // TinyMCE
     #[wasm_bindgen(js_namespace = tinymce)]
     fn init(options: &JsValue);
-    
+
     #[wasm_bindgen(js_namespace = tinymce)]
     fn get(id: &str) -> Option<TinyMCEEditor>;
-    
+
     #[wasm_bindgen(js_namespace = tinymce)]
     fn remove(selector: &str);
-    
+
     type TinyMCEEditor;
 
     #[wasm_bindgen(method, js_name = getContent)]
@@ -29,6 +29,9 @@ extern "C" {
 
     #[wasm_bindgen(method, js_name = setContent)]
     fn set_content(this: &TinyMCEEditor, content: &str);
+
+    #[wasm_bindgen(method, js_name = hasFocus)]
+    fn has_focus(this: &TinyMCEEditor) -> bool;
 
     #[wasm_bindgen(method, getter)]
     fn selection(this: &TinyMCEEditor) -> TinyMCESelection;
@@ -46,29 +49,33 @@ extern "C" {
 #[wasm_bindgen(module = "/inline_peer.js")]
 extern "C" {
     pub type Peer;
-    
+
     #[wasm_bindgen(js_name = newPeer)]
     fn new_peer(id: Option<String>) -> Peer;
-    
+
     #[wasm_bindgen(method, getter)]
     fn id(this: &Peer) -> Option<String>;
-    
+
     #[wasm_bindgen(method)]
     fn connect(this: &Peer, peer_id: &str) -> DataConnection;
-    
+
     #[wasm_bindgen(method)]
     fn on(this: &Peer, event: &str, callback: &JsValue);
-    
+
     pub type DataConnection;
-    
+
     #[wasm_bindgen(method)]
     fn on(this: &DataConnection, event: &str, callback: &JsValue);
-    
+
     #[wasm_bindgen(method)]
     fn send(this: &DataConnection, data: &str);
-    
+
     #[wasm_bindgen(method, getter)]
     fn peer(this: &DataConnection) -> String;
+
+    // Clipboard helper
+    #[wasm_bindgen(js_name = copyToClipboard)]
+    async fn copy_to_clipboard(text: &str) -> JsValue;
 }
 
 struct App {
@@ -102,6 +109,7 @@ enum Msg {
     SetEditing(Option<String>), // field name or None to stop editing
     ConnectToPeer,
     UpdatePeerIdInput(String),
+    CopyPeerId,
 }
 
 impl Component for App {
@@ -313,6 +321,14 @@ impl Component for App {
                 self.peer_id_to_connect = value;
                 false
             }
+            Msg::CopyPeerId => {
+                if let Some(peer_id) = self.my_id.clone() {
+                    spawn_local(async move {
+                        let _ = copy_to_clipboard(&peer_id).await;
+                    });
+                }
+                false
+            }
             Msg::UpdateField(key, value) => {
                 // Get current value to check if it actually changed
                 let current = self.get_str(key);
@@ -437,22 +453,30 @@ impl Component for App {
 
         html! {
             <div>
-                <header style="display: flex; flex-direction: column; gap: 15px; margin-bottom: 20px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                <header>
+                    <hgroup>
                         <h1>{ "WebRTC Collaborative Editor" }</h1>
-                    </div>
-                    
+                        <p>{ format!("v{}", version) }</p>
+                    </hgroup>
+
                     // P2P Connection Info - only show when not connected
                     if self.connections.is_empty() {
-                        <div style="background: #f5f5f5; padding: 12px; border-radius: 8px;">
-                            <div style="margin-bottom: 8px;">
-                                <strong>{"Your Peer ID: "}</strong>
-                                <code style="background: white; padding: 4px 8px; border-radius: 4px;">
-                                    { self.my_id.as_deref().unwrap_or("Initializing...") }
-                                </code>
-                            </div>
-                            <div style="display: flex; gap: 8px; align-items: center;">
-                                <input 
+                        <article>
+                            <label>{"Your Peer ID"}</label>
+                            <fieldset role="group">
+                                <input
+                                    type="text"
+                                    value={self.my_id.clone().unwrap_or_else(|| "Initializing...".to_string())}
+                                    readonly=true
+                                />
+                                <button type="button" onclick={ctx.link().callback(|_| Msg::CopyPeerId)}>
+                                    {"Copy"}
+                                </button>
+                            </fieldset>
+
+                            <label>{"Connect to Peer"}</label>
+                            <fieldset role="group">
+                                <input
                                     type="text"
                                     placeholder="Enter peer ID to connect"
                                     value={self.peer_id_to_connect.clone()}
@@ -460,149 +484,137 @@ impl Component for App {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
                                         Msg::UpdatePeerIdInput(input.value())
                                     })}
-                                    style="flex: 1; margin: 0;"
                                 />
-                                <button 
-                                    onclick={ctx.link().callback(|_| Msg::ConnectToPeer)} 
-                                    style="margin: 0;"
-                                >
+                                <button type="button" onclick={ctx.link().callback(|_| Msg::ConnectToPeer)}>
                                     {"Connect"}
                                 </button>
-                            </div>
-                        </div>
+                            </fieldset>
+                        </article>
                     } else {
-                        <div style="background: #e8f5e9; padding: 8px 12px; border-radius: 8px; font-size: 0.9em; color: #2e7d32;">
-                            {"✅ Connected to "}{ self.connections.len() }{ " peer(s)" }
-                        </div>
+                        <p><mark>{"Connected to "}{ self.connections.len() }{ " peer(s)" }</mark></p>
                     }
-                    
-                    // Online users and version
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div class="online-users">
-                            { for self.users.values().map(|user| {
-                                html! {
-                                    <span 
-                                        class={format!("user-badge {}", if user.editing { "active" } else { "inactive" })}
-                                    >
-                                        { &user.user_name }
-                                    </span>
-                                }
-                            })}
-                        </div>
-                        <span class="version">{ format!("v{}", version) }</span>
+
+                    // Online users
+                    <div class="online-users">
+                        { for self.users.values().map(|user| {
+                            html! {
+                                <span
+                                    class={format!("user-badge {}", if user.editing { "active" } else { "inactive" })}
+                                >
+                                    { &user.user_name }
+                                </span>
+                            }
+                        })}
                     </div>
                 </header>
 
                 if self.users.len() < 2 {
-                    <div style="text-align: center; padding: 40px; background: #f9f9f9; border-radius: 8px;">
-                        <h2>{"⏳ Waiting for collaborators..."}</h2>
-                        <p style="color: #666;">{"Share your Peer ID above with others to start collaborating."}</p>
-                        <p style="color: #888; font-size: 0.9em;">{"The editor will become available once another peer connects."}</p>
-                    </div>
+                    <article>
+                        <hgroup>
+                            <h2>{"Waiting for collaborators..."}</h2>
+                            <p>{"Share your Peer ID above with others to start collaborating."}</p>
+                        </hgroup>
+                        <p><small>{"The editor will become available once another peer connects."}</small></p>
+                    </article>
                 } else if self.mode == Mode::View {
-                    <div class="view-mode">
-                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 1rem;">
-                            <span class="mode-badge mode-view">{"VIEW MODE"}</span>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)} style="margin: 0;">
-                                {"✏️ Edit"}
+                    <article class="view-mode">
+                        <header>
+                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
+                                {"Edit"}
                             </button>
-                        </div>
+                        </header>
                         <h2>{ title }</h2>
-                        <p style="font-style: italic;">{ keywords }</p>
+                        <p><em>{ keywords }</em></p>
                         <hr/>
                         <div class="body-content">{Html::from_html_unchecked(body.into())}</div>
-                    </div>
+                    </article>
                 } else {
-                    <div class="edit-mode">
-                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 1rem;">
-                            <span class="mode-badge mode-edit">{"EDIT MODE (CRDT Active)"}</span>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)} style="margin: 0;">
-                                {"👁️ View"}
+                    <article class="edit-mode">
+                        <header>
+                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
+                                {"View"}
                             </button>
-                        </div>
+                        </header>
                         
-                        <div class="field field-with-cursors">
-                            <label>{ "Title" }</label>
-                            <div class="input-wrapper">
-                                <input 
-                                    key="title"
-                                    type="text" 
-                                    value={title}
-                                    oninput={ctx.link().callback(|e: InputEvent| {
-                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdateField(DOC_KEY_TITLE, input.value())
-                                    })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string()))) }
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
-                                />
-                                <div class="cursors">
-                                { for title_editors.iter().map(|user| {
+                        <div class="field">
+                            <label>
+                                { "Title" }
+                                { if !title_editors.is_empty() {
                                     html! {
-                                        <span 
-                                            class="cursor-indicator" 
-                                            title={user.user_name.clone()}
-                                        >
-                                            { &user.user_name }
-                                        </span>
+                                        <small>
+                                            {" (editing: "}
+                                            { for title_editors.iter().map(|user| html! { { &user.user_name } }) }
+                                            {")"}
+                                        </small>
                                     }
+                                } else {
+                                    html! {}
+                                }}
+                            </label>
+                            <input
+                                key="title"
+                                type="text"
+                                value={title}
+                                oninput={ctx.link().callback(|e: InputEvent| {
+                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                    Msg::UpdateField(DOC_KEY_TITLE, input.value())
                                 })}
-                                </div>
-                            </div>
+                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("title".to_string()))) }
+                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
+                            />
                         </div>
 
-                        <div class="field field-with-cursors">
-                            <label>{ "Keywords" }</label>
-                            <div class="input-wrapper">
-                                <input 
-                                    key="keywords"
-                                    type="text" 
-                                    value={keywords}
-                                    oninput={ctx.link().callback(|e: InputEvent| {
-                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                        Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
-                                    })}
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string()))) }
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
-                                />
-                                <div class="cursors">
-                                { for keywords_editors.iter().map(|user| {
+                        <div class="field">
+                            <label>
+                                { "Keywords" }
+                                { if !keywords_editors.is_empty() {
                                     html! {
-                                        <span 
-                                            class="cursor-indicator" 
-                                            title={user.user_name.clone()}
-                                        >
-                                            { &user.user_name }
-                                        </span>
+                                        <small>
+                                            {" (editing: "}
+                                            { for keywords_editors.iter().map(|user| html! { { &user.user_name } }) }
+                                            {")"}
+                                        </small>
                                     }
+                                } else {
+                                    html! {}
+                                }}
+                            </label>
+                            <input
+                                key="keywords"
+                                type="text"
+                                value={keywords}
+                                oninput={ctx.link().callback(|e: InputEvent| {
+                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                    Msg::UpdateField(DOC_KEY_KEYWORDS, input.value())
                                 })}
-                                </div>
-                            </div>
+                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("keywords".to_string()))) }
+                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string()))) }
+                            />
                         </div>
 
-                        <div class="field field-with-cursors">
-                            <label>{ "Body" }</label>
-                            <div class="input-wrapper">
-                                <div 
-                                    id="body-editor" 
-                                    class="inline-editor"
-                                    onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
-                                    onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
-                                ></div>
-                                <div class="cursors">
-                                { for body_editors.iter().map(|user| {
+                        <div class="field">
+                            <label>
+                                { "Body" }
+                                { if !body_editors.is_empty() {
                                     html! {
-                                        <span 
-                                            class="cursor-indicator" 
-                                            title={user.user_name.clone()}
-                                        >
-                                            { &user.user_name }
-                                        </span>
+                                        <small>
+                                            {" (editing: "}
+                                            { for body_editors.iter().map(|user| html! { { &user.user_name } }) }
+                                            {")"}
+                                        </small>
                                     }
-                                })}
-                                </div>
-                            </div>
+                                } else {
+                                    html! {}
+                                }}
+                            </label>
+                            <div
+                                id="body-editor"
+                                class="inline-editor"
+                                onfocus={ctx.link().callback(|_| Msg::SetEditing(Some("body".to_string())))}
+                                onblur={ctx.link().callback(|_| Msg::SetEditing(Some("general".to_string())))}
+                            ></div>
                         </div>
-                    </div>
+                    </article>
                 }
             </div>
         }
@@ -661,16 +673,23 @@ impl App {
                         .unwrap_or_default();
                     let current_content = editor.get_content();
                     if new_body != current_content {
-                        // Save cursor position before updating content
-                        let selection = editor.selection();
-                        let bookmark = selection.get_bookmark(2); // Type 2 = simple bookmark
+                        // Only save/restore cursor if the body editor currently has focus
+                        // If user is editing another field (title/keywords), don't interfere
+                        if editor.has_focus() {
+                            // Save cursor position before updating content
+                            let selection = editor.selection();
+                            let bookmark = selection.get_bookmark(2); // Type 2 = simple bookmark
 
-                        // Apply remote content
-                        editor.set_content(&new_body);
+                            // Apply remote content
+                            editor.set_content(&new_body);
 
-                        // Restore cursor position
-                        let selection = editor.selection();
-                        selection.move_to_bookmark(&bookmark);
+                            // Restore cursor position
+                            let selection = editor.selection();
+                            selection.move_to_bookmark(&bookmark);
+                        } else {
+                            // Just update content without touching cursor/focus
+                            editor.set_content(&new_body);
+                        }
                     }
                 }
             }
