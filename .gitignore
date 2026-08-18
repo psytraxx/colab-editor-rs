@@ -1,5 +1,4 @@
 /target
-/server/my_db/
 dist/
 node_modules/
 /client/target/

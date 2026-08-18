@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    # The client is the only thing this workflow deploys; worker-only changes
+    # shouldn't trigger a Pages rebuild.
+    paths:
+      - 'client/**'
+      - '.github/workflows/deploy-to-pages.yml'
 
 permissions:
   contents: read

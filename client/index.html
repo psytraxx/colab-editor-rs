@@ -130,6 +130,21 @@
         min-height: 220px;
         font-size: 1rem;
       }
+      /* View mode reuses Quill read-only: strip the input chrome so it reads
+         as prose rather than as a disabled form field. */
+      .quill-readonly {
+        border: none;
+        background: none;
+      }
+      .quill-readonly .ql-editor {
+        padding: 0;
+      }
+      .quill-readonly .ql-container {
+        /* The snow theme borders its container; view mode is prose, not a
+           form field, so clear it. */
+        border: none;
+        min-height: 0;
+      }
     </style>
   </head>
   <body>
