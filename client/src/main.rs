@@ -1,12 +1,11 @@
 use automerge::{
-    transaction::Transactable,
-    AutoCommit, ReadDoc,
+    patches::PatchAction, transaction::Transactable, AutoCommit, ObjId, ObjType, ReadDoc,
 };
-use web_sys::{console::log_1, WebSocket, MessageEvent, CloseEvent, ErrorEvent};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
+use web_sys::{console::log_1, CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 use yew::prelude::*;
-use serde::{Deserialize, Serialize};
 
 // Document field keys
 const DOC_KEY_TITLE: &str = "title";
@@ -35,56 +34,132 @@ struct UserState {
 }
 
 #[derive(Serialize)]
-struct TinyMceConfig {
-    selector: &'static str,
-    inline: bool,
-    menubar: bool,
-    plugins: &'static str,
-    toolbar: &'static str,
-    block_formats: &'static str,
-    license_key: &'static str,
+struct QuillConfig {
+    theme: &'static str,
+    modules: QuillModules,
+}
+
+#[derive(Serialize)]
+struct QuillModules {
+    toolbar: &'static [&'static str],
 }
 
 #[wasm_bindgen]
 extern "C" {
-    // TinyMCE
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn init(options: &JsValue);
+    type Quill;
 
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn get(id: &str) -> Option<TinyMCEEditor>;
+    #[wasm_bindgen(constructor)]
+    fn new(selector: &str, options: &JsValue) -> Quill;
 
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn remove(selector: &str);
+    #[wasm_bindgen(method, js_name = insertText)]
+    fn insert_text(this: &Quill, index: usize, text: &str, source: &str);
 
-    type TinyMCEEditor;
+    #[wasm_bindgen(method, js_name = deleteText)]
+    fn delete_text(this: &Quill, index: usize, length: usize, source: &str);
 
-    #[wasm_bindgen(method, js_name = getContent)]
-    fn get_content(this: &TinyMCEEditor) -> String;
+    #[wasm_bindgen(method, js_name = getText)]
+    fn get_text(this: &Quill) -> String;
 
-    #[wasm_bindgen(method, js_name = setContent)]
-    fn set_content(this: &TinyMCEEditor, content: &str);
+    #[wasm_bindgen(method, js_name = getContents)]
+    fn get_contents(this: &Quill) -> JsValue;
 
-    #[wasm_bindgen(method, js_name = hasFocus)]
-    fn has_focus(this: &TinyMCEEditor) -> bool;
+    #[wasm_bindgen(method, js_name = formatText)]
+    fn format_text(
+        this: &Quill,
+        index: usize,
+        length: usize,
+        name: &str,
+        value: &JsValue,
+        source: &str,
+    );
 
-    #[wasm_bindgen(method, getter)]
-    fn selection(this: &TinyMCEEditor) -> TinyMCESelection;
+    #[wasm_bindgen(method, js_name = removeFormat)]
+    fn remove_format(this: &Quill, index: usize, length: usize, source: &str);
 
-    type TinyMCESelection;
+    #[wasm_bindgen(method, js_name = on)]
+    fn on(this: &Quill, event: &str, handler: &js_sys::Function);
 
-    #[wasm_bindgen(method, js_name = getBookmark)]
-    fn get_bookmark(this: &TinyMCESelection, bookmark_type: i32) -> JsValue;
+    #[wasm_bindgen(method, js_name = getModule)]
+    fn get_module(this: &Quill, name: &str) -> JsValue;
+}
 
-    #[wasm_bindgen(method, js_name = moveToBookmark)]
-    fn move_to_bookmark(this: &TinyMCESelection, bookmark: &JsValue);
+/// The subset of Quill's Delta ops we care about: plain-text inserts carrying
+/// optional formatting attributes (bold/italic/header/list/link/code).
+#[derive(Deserialize)]
+struct DeltaOp {
+    #[serde(default)]
+    insert: Option<String>,
+    #[serde(default)]
+    attributes: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    ops: Vec<DeltaOp>,
+}
+
+/// Formatting attribute names we track as Automerge marks, matching the Quill
+/// toolbar configured in `init_quill`.
+const MARK_NAMES: &[&str] = &[
+    "bold",
+    "italic",
+    "underline",
+    "header",
+    "list",
+    "link",
+    "code",
+];
+
+fn scalar_from_json(value: &serde_json::Value) -> Option<automerge::ScalarValue> {
+    match value {
+        serde_json::Value::Bool(b) => Some((*b).into()),
+        serde_json::Value::String(s) => Some(s.clone().into()),
+        serde_json::Value::Number(n) => Some(n.to_string().into()),
+        _ => None,
+    }
+}
+
+fn json_from_scalar(value: &automerge::ScalarValue) -> JsValue {
+    match value {
+        automerge::ScalarValue::Boolean(b) => JsValue::from_bool(*b),
+        automerge::ScalarValue::Str(s) => JsValue::from_str(s),
+        other => JsValue::from_str(&other.to_string()),
+    }
+}
+
+/// Escapes text for safe use as both HTML content and (quoted) attribute
+/// values, since `render_body_html` uses it for both.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Builds a per-character "active mark set" over `[0, len)` from a list of
+/// `(name, value, start, end)` spans, so formatting can be compared
+/// positionally instead of by raw (and possibly differently-split) spans.
+fn mark_fingerprint(
+    len: usize,
+    spans: &[(String, String, usize, usize)],
+) -> Vec<Vec<(String, String)>> {
+    let mut fp = vec![Vec::new(); len];
+    for (name, value, start, end) in spans {
+        for slot in fp.iter_mut().take((*end).min(len)).skip(*start) {
+            slot.push((name.clone(), value.clone()));
+        }
+    }
+    for slot in &mut fp {
+        slot.sort();
+    }
+    fp
 }
 
 struct App {
     doc: AutoCommit,
     mode: Mode,
     ws: Option<WebSocket>,
-    tinymce_initialized: bool,
+    editor: Option<Quill>,
     users: HashMap<String, UserState>,
     my_id: Option<String>,
 }
@@ -101,8 +176,8 @@ enum Msg {
     WsClosed,
     WsError(String),
     UpdateField(&'static str, String),
-    ToggleMode,
-    SyncBodyFromTinyMCE,
+    SetMode(Mode),
+    QuillTextChanged,
 }
 
 impl Component for App {
@@ -142,7 +217,7 @@ impl Component for App {
                         txt.clone()
                     };
                     log_1(&format!("[WS] Received: {}", log_txt).into());
-                    
+
                     match serde_json::from_str::<WsMessage>(&txt) {
                         Ok(msg) => {
                             link_msg.send_message(Msg::WsMessage(msg));
@@ -190,7 +265,7 @@ impl Component for App {
             doc,
             mode: Mode::View,
             ws,
-            tinymce_initialized: false,
+            editor: None,
             users: HashMap::new(),
             my_id: None,
         }
@@ -200,14 +275,20 @@ impl Component for App {
         match msg {
             Msg::WsMessage(ws_msg) => {
                 match ws_msg {
-                    WsMessage::Init { user_id, snapshot, users } => {
+                    WsMessage::Init {
+                        user_id,
+                        snapshot,
+                        users,
+                    } => {
                         log_1(&format!("[WS] Init! My ID: {}", user_id).into());
                         self.my_id = Some(user_id.clone());
 
                         // Load snapshot if present
                         if let Some(data) = snapshot {
                             match AutoCommit::load(&data) {
-                                Ok(doc) => { self.apply_incoming_doc(doc, true); }
+                                Ok(doc) => {
+                                    self.apply_incoming_doc(doc, true);
+                                }
                                 Err(_) => log_1(&"[WS] Failed to load snapshot".into()),
                             }
                         }
@@ -221,16 +302,21 @@ impl Component for App {
                         }
 
                         // Add self to users list
-                        self.users.insert(user_id.clone(), UserState {
-                            user_id,
-                            online: true,
-                            editing: false,
-                        });
+                        self.users.insert(
+                            user_id.clone(),
+                            UserState {
+                                user_id,
+                                online: true,
+                                editing: false,
+                            },
+                        );
 
                         true
                     }
                     WsMessage::Content(data) => {
-                        log_1(&format!("[WS] Received Content update, {} bytes", data.len()).into());
+                        log_1(
+                            &format!("[WS] Received Content update, {} bytes", data.len()).into(),
+                        );
                         match AutoCommit::load(&data) {
                             Ok(remote_doc) => self.apply_incoming_doc(remote_doc, false),
                             Err(_) => {
@@ -239,9 +325,7 @@ impl Component for App {
                             }
                         }
                     }
-                    WsMessage::UserState(user_state) => {
-                        self.handle_user_state(user_state)
-                    }
+                    WsMessage::UserState(user_state) => self.handle_user_state(user_state),
                 }
             }
             Msg::WsConnected => {
@@ -257,64 +341,54 @@ impl Component for App {
                 log_1(&format!("[WS] WebSocket error: {}", err).into());
                 false
             }
-            Msg::UpdateField(key, value) => {
-                self.set_field(key, value)
-            }
-            Msg::ToggleMode => {
-                self.mode = match self.mode {
+            Msg::UpdateField(key, value) => self.set_field(key, value),
+            Msg::SetMode(new_mode) => {
+                if new_mode == self.mode {
+                    return false;
+                }
+                match new_mode {
+                    Mode::Edit => self.set_editing(true),
                     Mode::View => {
-                        self.set_editing(true);
-                        Mode::Edit
-                    }
-                    Mode::Edit => {
-                        // Sync body from TinyMCE before tearing it down
-                        if self.tinymce_initialized {
-                            self.sync_body_from_tinymce();
-                            remove("#body-editor");
-                            self.tinymce_initialized = false;
-                        }
+                        // Sync any trailing edit before tearing the editor down.
+                        self.sync_body_from_editor();
+                        self.teardown_quill();
                         self.set_editing(false);
-                        Mode::View
                     }
-                };
+                }
+                self.mode = new_mode;
                 true
             }
-            Msg::SyncBodyFromTinyMCE => {
-                self.sync_body_from_tinymce();
+            Msg::QuillTextChanged => {
+                self.sync_body_from_editor();
                 false
             }
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, _first_render: bool) {
-        // Initialize TinyMCE only once the edit-mode DOM node actually exists.
-        if self.mode == Mode::Edit && !self.tinymce_initialized {
-            self.init_tinymce(ctx);
+        // Initialize Quill only once the edit-mode DOM node actually exists.
+        if self.mode == Mode::Edit && self.editor.is_none() {
+            self.init_quill(ctx);
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let title = self.get_str(DOC_KEY_TITLE);
         let keywords = self.get_str(DOC_KEY_KEYWORDS);
-        let body = self.get_str(DOC_KEY_BODY);
+        let body_html = self.render_body_html();
         let version = self.get_u64(DOC_KEY_VERSION);
 
         html! {
-            <div>
-                <header>
-                    <hgroup>
-                        <h1>{ "Collaborative Editor" }</h1>
-                        <p>{ format!("v{}", version) }</p>
-                    </hgroup>
+            <main class="container">
+                <header class="app-header">
+                    <div class="connection-status">
+                        if self.ws.is_some() {
+                            <mark>{ format!("Connected — {} user(s)", self.users.len()) }</mark>
+                        } else {
+                            <span>{"Connecting to server…"}</span>
+                        }
+                    </div>
 
-                    // Connection status
-                    if self.ws.is_some() {
-                        <p><mark>{ format!("Connected - {} user(s)", self.users.len()) }</mark></p>
-                    } else {
-                        <p>{"Connecting to server..."}</p>
-                    }
-
-                    // Online users
                     <div class="online-users">
                         { for self.users.values().map(|user| {
                             let class = if user.editing {
@@ -331,26 +405,38 @@ impl Component for App {
                     </div>
                 </header>
 
+                <div class="mode-switch-row">
+                    <fieldset class="mode-switch">
+                        <label>
+                            <input
+                                type="checkbox"
+                                role="switch"
+                                checked={self.mode == Mode::Edit}
+                                onclick={ctx.link().callback(|e: MouseEvent| {
+                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                    Msg::SetMode(if input.checked() { Mode::Edit } else { Mode::View })
+                                })}
+                            />
+                            { if self.mode == Mode::Edit { "Edit mode" } else { "View mode" } }
+                        </label>
+                    </fieldset>
+                    <span class="version-pill">{ format!("v{}", version) }</span>
+                </div>
+
                 if self.mode == Mode::View {
-                    <article class="view-mode">
-                        <header>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
-                                {"Edit"}
-                            </button>
-                        </header>
-                        <h2>{ title }</h2>
-                        <p><em>{ keywords }</em></p>
-                        <hr/>
-                        <div class="body-content">{Html::from_html_unchecked(body.into())}</div>
+                    <article class="content-card view-mode">
+                        <h2 class="view-title">{ title }</h2>
+                        if !keywords.trim().is_empty() {
+                            <div class="keyword-chips">
+                                { for keywords.split(',').map(|kw| kw.trim()).filter(|kw| !kw.is_empty()).map(|kw| {
+                                    html! { <span class="keyword-chip">{ kw }</span> }
+                                })}
+                            </div>
+                        }
+                        <div class="body-content" style="white-space: pre-wrap;">{Html::from_html_unchecked(body_html.into())}</div>
                     </article>
                 } else {
-                    <article class="edit-mode">
-                        <header>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
-                                {"View"}
-                            </button>
-                        </header>
-                        
+                    <article class="content-card edit-mode">
                         <div class="field">
                             <label>{ "Title" }</label>
                             <input
@@ -379,14 +465,11 @@ impl Component for App {
 
                         <div class="field">
                             <label>{ "Body" }</label>
-                            <div
-                                id="body-editor"
-                                class="inline-editor"
-                            ></div>
+                            <div id="body-editor" class="quill-editor"></div>
                         </div>
                     </article>
                 }
-            </div>
+            </main>
         }
     }
 }
@@ -415,6 +498,122 @@ impl App {
         }
     }
 
+    /// The body field is stored as an Automerge `Text` CRDT object (not a plain
+    /// scalar string), so that local/remote edits can be applied as minimal
+    /// character-level splices instead of whole-document replacement.
+    fn body_obj(&mut self) -> ObjId {
+        if let Ok(Some((automerge::Value::Object(ObjType::Text), id))) =
+            self.doc.get(automerge::ROOT, DOC_KEY_BODY)
+        {
+            return id;
+        }
+        self.doc
+            .put_object(automerge::ROOT, DOC_KEY_BODY, ObjType::Text)
+            .unwrap()
+    }
+
+    fn body_obj_ref(&self) -> Option<ObjId> {
+        match self.doc.get(automerge::ROOT, DOC_KEY_BODY) {
+            Ok(Some((automerge::Value::Object(ObjType::Text), id))) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn get_body(&self) -> String {
+        match self.body_obj_ref() {
+            Some(id) => self.doc.text(&id).unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    /// Render the body as HTML for the read-only View mode, reconstructing
+    /// inline formatting (bold/italic/underline/code/link) from Automerge
+    /// marks. Header/list are block-level in Quill's model (attached to the
+    /// line-ending character, not a text span) and are not reconstructed
+    /// here — View mode shows their text content without that structure.
+    fn render_body_html(&self) -> String {
+        let Some(body_obj) = self.body_obj_ref() else {
+            return String::new();
+        };
+        let text: Vec<char> = self
+            .doc
+            .text(&body_obj)
+            .unwrap_or_default()
+            .chars()
+            .collect();
+        let marks: Vec<automerge::marks::Mark> = self
+            .doc
+            .marks(&body_obj)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| matches!(m.name(), "bold" | "italic" | "underline" | "code" | "link"))
+            .collect();
+
+        if marks.is_empty() {
+            return html_escape(&text.iter().collect::<String>());
+        }
+
+        let mut cuts: Vec<usize> = vec![0, text.len()];
+        for m in &marks {
+            cuts.push(m.start.min(text.len()));
+            cuts.push(m.end.min(text.len()));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut out = String::new();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a >= b {
+                continue;
+            }
+            let active: Vec<&automerge::marks::Mark> = marks
+                .iter()
+                .filter(|m| m.start <= a && m.end >= b)
+                .collect();
+            let escaped = html_escape(&text[a..b].iter().collect::<String>());
+
+            let mut open = String::new();
+            let mut close = String::new();
+            for name in ["link", "bold", "italic", "underline", "code"] {
+                let Some(m) = active.iter().find(|m| m.name() == name) else {
+                    continue;
+                };
+                match name {
+                    "link" => {
+                        let href = match m.value() {
+                            automerge::ScalarValue::Str(s) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        open.push_str(&format!("<a href=\"{}\">", html_escape(&href)));
+                        close.insert_str(0, "</a>");
+                    }
+                    "bold" => {
+                        open.push_str("<strong>");
+                        close.insert_str(0, "</strong>");
+                    }
+                    "italic" => {
+                        open.push_str("<em>");
+                        close.insert_str(0, "</em>");
+                    }
+                    "underline" => {
+                        open.push_str("<u>");
+                        close.insert_str(0, "</u>");
+                    }
+                    "code" => {
+                        open.push_str("<code>");
+                        close.insert_str(0, "</code>");
+                    }
+                    _ => {}
+                }
+            }
+            out.push_str(&open);
+            out.push_str(&escaped);
+            out.push_str(&close);
+        }
+        out
+    }
+
     fn handle_user_state(&mut self, user_state: UserState) -> bool {
         // We manage our own presence locally; ignore echoes of it from the server.
         if self.my_id.as_ref() == Some(&user_state.user_id) {
@@ -428,6 +627,13 @@ impl App {
         true
     }
 
+    fn bump_version(&mut self) {
+        let version = self.get_u64(DOC_KEY_VERSION);
+        self.doc
+            .put(automerge::ROOT, DOC_KEY_VERSION, version + 1)
+            .unwrap();
+    }
+
     /// Set a document field, bump the version, and broadcast the new snapshot.
     /// Returns whether the field actually changed.
     fn set_field(&mut self, key: &'static str, value: String) -> bool {
@@ -435,46 +641,194 @@ impl App {
             return false;
         }
         self.doc.put(automerge::ROOT, key, value).unwrap();
-        let version = self.get_u64(DOC_KEY_VERSION);
-        self.doc.put(automerge::ROOT, DOC_KEY_VERSION, version + 1).unwrap();
+        self.bump_version();
         self.broadcast_doc();
         true
     }
 
-    fn sync_body_from_tinymce(&mut self) {
-        if let Some(editor) = get("body-editor") {
-            self.set_field(DOC_KEY_BODY, editor.get_content());
+    /// Diff the editor's current text against the CRDT body and record only
+    /// the changed span as Automerge ops (via a Myers diff), instead of
+    /// replacing the whole field. Also resyncs formatting marks. Called on
+    /// every real user keystroke (text edit or toolbar formatting change).
+    fn sync_body_from_editor(&mut self) {
+        let Some(editor) = &self.editor else { return };
+        let delta_value = editor.get_contents();
+        let delta: Delta =
+            serde_wasm_bindgen::from_value(delta_value).unwrap_or(Delta { ops: vec![] });
+        // Quill's document model always ends in a structural "\n" (its
+        // implicit final block), which `getContents()` includes as literal
+        // text. Strip exactly one trailing newline before treating this as
+        // the stored body — otherwise it accumulates by one "\n" on every
+        // sync, since Quill adds its own trailing "\n" again on next load
+        // without ever deduping existing ones.
+        let raw_text: String = delta
+            .ops
+            .iter()
+            .filter_map(|op| op.insert.as_deref())
+            .collect();
+        let text = raw_text.strip_suffix('\n').unwrap_or(&raw_text).to_string();
+
+        let text_changed = text != self.get_body();
+        let body_obj = self.body_obj();
+        // Automerge's mark()/unmark() always record ops, even when they have
+        // no net effect (same as put() — see set_field's equality guard), so
+        // rewrite_marks must only run when formatting has actually changed,
+        // not merely on every call (e.g. entering/leaving edit mode with no
+        // edits would otherwise still bump the version).
+        let marks_changed = self.marks_differ_from_delta(&body_obj, &delta, text.chars().count());
+
+        if !text_changed && !marks_changed {
+            return;
+        }
+        if text_changed {
+            self.doc.update_text(&body_obj, &text).unwrap();
+        }
+        if marks_changed {
+            self.rewrite_marks(&body_obj, &delta);
+        }
+        self.bump_version();
+        self.broadcast_doc();
+    }
+
+    /// Compares the formatting implied by a Quill Delta against the CRDT's
+    /// current marks, per character rather than by raw span boundaries —
+    /// Quill may split a run of identically-formatted text into several
+    /// Delta ops that don't line up with Automerge's coalesced mark spans,
+    /// so comparing spans directly would report spurious differences.
+    fn marks_differ_from_delta(&self, body_obj: &ObjId, delta: &Delta, text_len: usize) -> bool {
+        let mut desired_spans = Vec::new();
+        let mut pos = 0usize;
+        for op in &delta.ops {
+            let Some(text) = &op.insert else { continue };
+            let span_len = text.chars().count();
+            if let Some(attrs) = &op.attributes {
+                for (name, value) in attrs {
+                    if !MARK_NAMES.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if let Some(scalar) = scalar_from_json(value) {
+                        desired_spans.push((name.clone(), scalar.to_string(), pos, pos + span_len));
+                    }
+                }
+            }
+            pos += span_len;
+        }
+
+        let current_spans: Vec<_> = self
+            .doc
+            .marks(body_obj)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| MARK_NAMES.contains(&m.name()))
+            .map(|m| (m.name().to_string(), m.value().to_string(), m.start, m.end))
+            .collect();
+
+        mark_fingerprint(text_len, &desired_spans) != mark_fingerprint(text_len, &current_spans)
+    }
+
+    /// Replace all formatting marks on the body text with the spans implied
+    /// by a Quill Delta's `attributes`. Marks don't change text length or
+    /// position, so this never disturbs cursor placement.
+    fn rewrite_marks(&mut self, body_obj: &ObjId, delta: &Delta) {
+        let len = self
+            .doc
+            .text(body_obj)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        for name in MARK_NAMES {
+            let _ = self
+                .doc
+                .unmark(body_obj, name, 0, len, automerge::marks::ExpandMark::Both);
+        }
+
+        let mut pos = 0usize;
+        for op in &delta.ops {
+            let Some(text) = &op.insert else { continue };
+            let span_len = text.chars().count();
+            if let Some(attrs) = &op.attributes {
+                for (name, value) in attrs {
+                    if !MARK_NAMES.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if let Some(scalar) = scalar_from_json(value) {
+                        let mark =
+                            automerge::marks::Mark::new(name.clone(), scalar, pos, pos + span_len);
+                        let _ = self
+                            .doc
+                            .mark(body_obj, mark, automerge::marks::ExpandMark::None);
+                    }
+                }
+            }
+            pos += span_len;
         }
     }
 
-    /// Merge or replace an incoming document and refresh the editor if the body changed.
+    /// Merge or replace an incoming document and apply only the body's
+    /// changed span to the live editor (if mounted), preserving cursor
+    /// position by construction instead of replacing editor content wholesale.
     fn apply_incoming_doc(&mut self, mut incoming: AutoCommit, replace: bool) -> bool {
-        let body_before = self.get_str(DOC_KEY_BODY);
+        let heads_before = self.doc.get_heads();
         if replace {
             self.doc = incoming;
         } else if let Err(e) = self.doc.merge(&mut incoming) {
             log_1(&format!("[WS] Merge failed: {:?}", e).into());
             return false;
         }
-        let body_after = self.get_str(DOC_KEY_BODY);
-        if body_before != body_after && self.tinymce_initialized {
-            self.refresh_editor_body(&body_after);
+        let heads_after = self.doc.get_heads();
+
+        if self.editor.is_some() {
+            let body_obj = self.body_obj();
+            let mut marks_changed = false;
+            let patches = self.doc.diff(&heads_before, &heads_after);
+            {
+                let editor = self.editor.as_ref().unwrap();
+                for patch in &patches {
+                    if patch.obj != body_obj {
+                        continue;
+                    }
+                    match &patch.action {
+                        PatchAction::SpliceText { index, value, .. } => {
+                            editor.insert_text(*index, &value.make_string(), "silent");
+                        }
+                        PatchAction::DeleteSeq { index, length } => {
+                            editor.delete_text(*index, *length, "silent");
+                        }
+                        PatchAction::Mark { .. } => marks_changed = true,
+                        _ => {}
+                    }
+                }
+            }
+            if marks_changed {
+                self.resync_marks_to_editor(&body_obj);
+            }
         }
         true
     }
 
-    fn refresh_editor_body(&self, body: &str) {
-        let Some(editor) = get("body-editor") else { return };
-        if editor.get_content() == body {
-            return;
+    /// Re-derive the editor's formatting from the CRDT's current mark spans.
+    /// Ranges only (no content insert/delete), so cursor position is unaffected.
+    fn resync_marks_to_editor(&mut self, body_obj: &ObjId) {
+        let Some(editor) = &self.editor else { return };
+        let len = self
+            .doc
+            .text(body_obj)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        if len > 0 {
+            editor.remove_format(0, len, "silent");
         }
-        if editor.has_focus() {
-            // Preserve the cursor position across the content swap.
-            let bookmark = editor.selection().get_bookmark(2);
-            editor.set_content(body);
-            editor.selection().move_to_bookmark(&bookmark);
-        } else {
-            editor.set_content(body);
+        for mark in self.doc.marks(body_obj).unwrap_or_default() {
+            if !MARK_NAMES.contains(&mark.name.as_str()) {
+                continue;
+            }
+            let value = json_from_scalar(mark.value());
+            editor.format_text(
+                mark.start,
+                mark.end - mark.start,
+                mark.name(),
+                &value,
+                "silent",
+            );
         }
     }
 
@@ -514,56 +868,70 @@ impl App {
         }
     }
 
-    fn init_tinymce(&mut self, ctx: &Context<Self>) {
-        if self.tinymce_initialized {
+    /// Quill's `snow` theme, given an array `toolbar` config, creates its own
+    /// `.ql-toolbar` element as a *sibling before* the container we mounted
+    /// it in — outside anything Yew's virtual DOM diffing tracks. Removing
+    /// only `#body-editor` (which Yew handles for us when the edit-mode
+    /// branch unmounts) leaves that toolbar behind, so it must be torn down
+    /// explicitly here or it accumulates on every Edit/View toggle.
+    fn teardown_quill(&mut self) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let toolbar_module = editor.get_module("toolbar");
+        if let Ok(container) = js_sys::Reflect::get(&toolbar_module, &"container".into()) {
+            if let Some(el) = container.dyn_ref::<web_sys::Element>() {
+                el.remove();
+            }
+        }
+    }
+
+    fn init_quill(&mut self, ctx: &Context<Self>) {
+        if self.editor.is_some() {
             return;
         }
-        self.tinymce_initialized = true;
+
+        let config = QuillConfig {
+            theme: "snow",
+            modules: QuillModules {
+                toolbar: &[
+                    "bold",
+                    "italic",
+                    "underline",
+                    "header",
+                    "list",
+                    "link",
+                    "code",
+                ],
+            },
+        };
+        let options: JsValue = serde_wasm_bindgen::to_value(&config).unwrap();
+        let editor = Quill::new("#body-editor", &options);
+
+        // Quill starts empty; load the current CRDT body and its formatting
+        // without firing text-change (source "silent"), so it isn't mistaken
+        // for a user edit.
+        let body = self.get_body();
+        if !body.is_empty() {
+            editor.insert_text(0, &body, "silent");
+        }
+        self.editor = Some(editor);
+        let body_obj = self.body_obj();
+        self.resync_marks_to_editor(&body_obj);
+        let editor = self.editor.as_ref().unwrap();
 
         let link = ctx.link().clone();
-        let body_content = self.get_str(DOC_KEY_BODY);
-
-        let config = TinyMceConfig {
-            selector: "#body-editor",
-            inline: true,
-            menubar: true,
-            plugins: "lists link image table code",
-            toolbar: "formatselect | undo redo | bold italic underline | alignleft aligncenter alignright | outdent indent | bullist numlist | link image | code",
-            block_formats: "Paragraph=p;Heading 1=h1;Heading 2=h2;Heading 3=h3;Heading 4=h4",
-            license_key: "gpl",
-        };
-        let options: js_sys::Object = serde_wasm_bindgen::to_value(&config)
-            .unwrap()
-            .unchecked_into();
-
-        let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
-            let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
-            let on_fn = on_method.unchecked_into::<js_sys::Function>();
-
-            // Set the initial content once the editor reports it is ready.
-            let body = body_content.clone();
-            let on_init = Closure::wrap(Box::new(move || {
-                if let Some(ed) = get("body-editor") {
-                    ed.set_content(&body);
+        let on_text_change = Closure::wrap(Box::new(
+            move |_delta: JsValue, _old: JsValue, source: JsValue| {
+                // Programmatic ("silent") updates never reach this handler, so
+                // any event here is guaranteed to be real user input.
+                if source.as_string().as_deref() == Some("user") {
+                    link.send_message(Msg::QuillTextChanged);
                 }
-            }) as Box<dyn Fn()>);
-            let _ = on_fn.call2(&editor, &"init".into(), on_init.as_ref().unchecked_ref());
-            on_init.forget();
-
-            // Push local edits into the Automerge document.
-            let link_inner = link.clone();
-            let on_change = Closure::wrap(Box::new(move || {
-                link_inner.send_message(Msg::SyncBodyFromTinyMCE);
-            }) as Box<dyn Fn()>);
-            let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
-            let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
-            on_change.forget();
-        }) as Box<dyn Fn(JsValue)>);
-
-        js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
-        setup_fn.forget();
-
-        init(&options.into());
+            },
+        ) as Box<dyn FnMut(JsValue, JsValue, JsValue)>);
+        editor.on("text-change", on_text_change.as_ref().unchecked_ref());
+        on_text_change.forget();
     }
 }
 
