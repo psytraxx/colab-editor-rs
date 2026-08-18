@@ -1,145 +1,119 @@
-git-u# WebRTC Collaborative Editor (Rust + WASM)
+# Collaborative Editor (Rust + WASM)
 
-A **serverless peer-to-peer collaborative text editor** built with Rust, WebAssembly, Automerge CRDT, and WebRTC. https://psytraxx.github.io/colab-editor-rs/
+A **collaborative text editor** built with Rust, WebAssembly, and Automerge CRDT, relayed through a lightweight Cloudflare Worker. https://psytraxx.github.io/colab-editor-rs/
 
-## 🚀 Features
+## Features
 
-- **Pure P2P Architecture**: No central server required - peers connect directly via WebRTC
 - **Conflict-Free Sync**: Uses Automerge CRDT for automatic conflict resolution
 - **Real-time Collaboration**: See other users' edits and presence in real-time
 - **Rich Text Editing**: Powered by TinyMCE for WYSIWYG editing
-- **User Presence**: Visual indicators showing who's online and what they're editing
+- **User Presence**: Visual indicators showing who's online and who's currently editing
+- **Serverless Hosting**: The relay runs on a Cloudflare Worker + Durable Object — no traditional backend to operate
 
-## 🏗️ Architecture
+## Architecture
 
-### Client-Only Design
-This application runs entirely in the browser with no backend server:
+This is a **client + relay** design, not peer-to-peer:
 
-- **WebRTC Data Channels**: Direct peer-to-peer communication
-- **PeerJS**: Simplified WebRTC with built-in signaling (uses public signaling server)
-- **Automerge**: CRDT library ensuring eventual consistency across all peers
-- **Full Mesh Network**: Each peer maintains connections to all other peers
+- **Client** (`client/`): Rust/WASM app built with the Yew framework. Holds an Automerge document (`AutoCommit`) locally, renders the UI, and talks to the relay over a single WebSocket connection.
+- **Relay** (`worker/`): A Cloudflare Worker using a Durable Object (`EditorRoom`) as a single shared room. It tracks connected WebSocket sessions, persists the latest Automerge document snapshot in Durable Object storage, and broadcasts messages to every other connected client (hub-and-spoke, not a mesh).
+- **Automerge**: CRDT library ensuring eventual consistency across all clients merging concurrent edits.
 
 ### How It Works
 
-1. **Peer Discovery**: When you open the app, PeerJS assigns you a unique ID
-2. **Connection**: Share your Peer ID with others, and they can connect to you
-3. **Sync**: Once connected, Automerge automatically syncs document state
-4. **Collaboration**: All edits are broadcast to connected peers in real-time
-5. **Conflict Resolution**: Automerge handles concurrent edits automatically
+1. **Connect**: On load, the client opens a WebSocket to the worker's `/ws` endpoint.
+2. **Init**: The Durable Object assigns the client a random user ID and sends an `Init` message containing the current document snapshot (if any) and the list of currently online users.
+3. **Edit**: Local edits update the Automerge document. On any change, the client serializes the *entire* document (`doc.save()`) and sends it as a `Content` message — this is state-based (full-snapshot) sync, not incremental.
+4. **Relay & Persist**: The worker persists the received snapshot to Durable Object storage and rebroadcasts it to every other connected client.
+5. **Merge**: Receiving clients `merge()` the incoming snapshot into their local Automerge document, so concurrent edits resolve automatically via CRDT semantics.
+6. **Presence**: Clients also send `UserState` messages (online/editing flags) which the worker rebroadcasts to keep everyone's presence indicators in sync.
 
-## 🛠️ Technology Stack
+## Technology Stack
 
-- **Rust** + **WebAssembly** for high-performance client-side logic
+- **Rust** + **WebAssembly** for client-side logic
 - **Yew** framework for reactive UI
 - **Automerge** CRDT for distributed state management
-- **PeerJS** for WebRTC peer connections
 - **TinyMCE** for rich text editing
 - **Trunk** for WASM build tooling
+- **Cloudflare Workers + Durable Objects** for the WebSocket relay (see `worker/README.md`)
 
-## 📦 Building & Running
+## Building & Running
 
 ### Prerequisites
-- Rust toolchain (with wasm32-unknown-unknown target)
+- Rust toolchain (with `wasm32-unknown-unknown` target)
 - Trunk (`cargo install trunk`)
+- Node.js (for the worker, see `worker/README.md`)
 
-### Development
+### Client — Development
 ```bash
 cd client
 trunk serve --port 8081
 ```
 
-Open your browser to `http://localhost:8081`
+Open your browser to `http://localhost:8081`. By default the client connects to `ws://localhost:8787/ws` when running on `localhost`/`127.0.0.1`, and to the deployed production worker otherwise — see `client/src/main.rs`.
 
-### Production Build
+### Client — Production Build
 ```bash
 cd client
 trunk build --release
 ```
 
-Static files will be in `client/dist/`
+Static files will be in `client/dist/`.
 
-## 🎮 Usage
+### Relay Worker
+```bash
+cd worker
+npm install
+npm run dev      # local dev server, defaults to ws://localhost:8787/ws
+npm run deploy   # deploy to Cloudflare
+```
 
-1. **Start the app**: Open it in your browser
-2. **Get your Peer ID**: Displayed at the top of the page
-3. **Connect to peers**: 
-   - Share your Peer ID with collaborators
-   - Enter their Peer ID in the input field and click "Connect"
-4. **Collaborate**: Once connected, start editing together!
+## Usage
 
-### Modes
-- **View Mode**: Read-only view with rendered HTML
-- **Edit Mode**: Live collaborative editing with TinyMCE
+1. **Start the app**: Open it in your browser; it connects to the relay automatically.
+2. **View mode**: Read-only rendered view of the document.
+3. **Edit mode**: Click "Edit" to open the TinyMCE editor and start collaborating — all connected clients see changes in near real-time.
 
-## 🔧 Project Structure
+## Project Structure
 
 ```
 colab-editor-rs/
-├── client/           # WASM client application
+├── client/            # Rust/WASM client (Yew UI + Automerge doc + WebSocket)
 │   ├── src/
-│   │   └── main.rs   # Main P2P logic
-│   ├── index.html    # Entry HTML
-│   └── inline_peer.js # PeerJS wrapper
-├── common/           # Shared types/constants
-│   └── src/
-│       └── lib.rs    # WsMessage, UserState definitions
-└── server/           # (DEPRECATED - no longer used)
+│   │   └── main.rs    # App component, WS handling, Automerge sync, TinyMCE bindings
+│   ├── index.html     # Entry HTML
+│   └── static/         # Static assets (TinyMCE, etc.)
+└── worker/            # Cloudflare Worker relay (Durable Object)
+    └── src/
+        └── index.ts   # HTTP router + EditorRoom Durable Object
 ```
 
-## 🌐 How P2P Networking Works
+## Security Considerations
 
-### Connection Flow
-```
-Peer A                    PeerJS Signaling Server             Peer B
-  |                                  |                           |
-  |------- Register --------------->|                           |
-  |<------ Assigned ID: "abc123" ---|                           |
-  |                                  |<-------- Register ---------|
-  |                                  |------- ID: "xyz789" ----->|
-  |                                  |                           |
-  |------- Connect to "xyz789" ---->|                           |
-  |                                  |------- Signal ----------->|
-  |<--------------------------------- WebRTC Handshake -------->|
-  |                                  |                           |
-  |<============ Direct P2P Connection Established ============>|
-```
+- All document content and presence data pass through the Cloudflare Worker relay, which persists the latest snapshot in Durable Object storage.
+- There is currently **no authentication or access control** — anyone with the WebSocket URL can join the single shared room and read/write the document.
+- Consider adding auth, per-room isolation, and/or end-to-end encryption before using this for sensitive content.
 
-### Data Synchronization
-All document changes flow through:
-1. **Local Edit** → Update Automerge document
-2. **Generate Sync Message** → Automerge creates minimal change set
-3. **Broadcast** → Send to all connected peers via WebRTC
-4. **Receive & Merge** → Peers apply changes to their Automerge docs
-5. **UI Update** → React to document changes
+## Notes
 
-## 🔒 Security Considerations
+- **Persistence**: The document snapshot is persisted server-side in Durable Object storage; there is no client-side (IndexedDB) persistence yet.
+- **Single Room**: The worker currently routes all clients into one shared `default-room` Durable Object. Multi-room support would require adding room IDs to the routing.
+- **Sync Model**: Full-document-snapshot sync on every change (not Automerge's incremental sync protocol), which is simple but not bandwidth-efficient for large documents.
 
-- Data is transmitted directly between peers (P2P)
-- PeerJS signaling server only facilitates initial connection setup
-- No central authority stores or sees your data
-- Consider adding end-to-end encryption for sensitive content
+## Future Enhancements
 
-## 📝 Notes
-
-- **Browser Compatibility**: Requires modern browser with WebRTC support
-- **NAT Traversal**: PeerJS handles most NAT/firewall scenarios via STUN/TURN
-- **Persistence**: Currently in-memory only - add IndexedDB for local persistence
-- **Scalability**: Full mesh works well for small groups (2-10 peers)
-
-## 🚧 Future Enhancements
-
-- [ ] IndexedDB local persistence
+- [ ] IndexedDB local/offline persistence
 - [ ] Offline editing with sync on reconnect
+- [ ] Multi-room support
+- [ ] Authentication / access control
 - [ ] End-to-end encryption
+- [ ] Incremental Automerge sync instead of full-snapshot broadcasts
 - [ ] File attachments
 - [ ] Export to PDF/Markdown
-- [ ] Custom TURN server for better NAT traversal
 
-## 📄 License
+## License
 
 MIT
 
-## 🤝 Contributing
+## Contributing
 
-Contributions welcome! This is a demonstration of P2P collaborative editing with Rust/WASM.
+Contributions welcome! This is a demonstration of collaborative editing with Rust/WASM, Automerge, and Cloudflare Workers.
