@@ -227,7 +227,7 @@ impl Component for App {
 
                         <div class="field">
                             <label>{ "Body" }</label>
-                            <div id="body-editor" class="quill-editor"></div>
+                            <div key="body-editor-edit" id="body-editor" class="quill-editor"></div>
                         </div>
                     } else {
                         <h2 class="view-title">{ title }</h2>
@@ -238,7 +238,7 @@ impl Component for App {
                                 })}
                             </div>
                         }
-                        <div id="body-editor" class="quill-editor quill-readonly"></div>
+                        <div key="body-editor-view" id="body-editor" class="quill-editor quill-readonly"></div>
                     }
                 </article>
             </main>
@@ -572,6 +572,17 @@ impl App {
             if let Some(el) = container.dyn_ref::<web_sys::Element>() {
                 el.remove();
             }
+        }
+        // Quill's own children (`.ql-editor`, `.ql-clipboard`, …) live inside
+        // `#body-editor` but are invisible to Yew's diffing. If that node is
+        // ever reused across a mode switch, mounting a fresh Quill into it
+        // appends a *second* editor beside the stale one and the body renders
+        // twice. Empty the container so a remount always starts clean.
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("body-editor"))
+        {
+            el.set_inner_html("");
         }
     }
 

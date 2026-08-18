@@ -6,6 +6,7 @@ entries are grouped by date instead.
 
 ## 2026-08-18
 
+- Fixed the article body rendering twice after switching into edit mode.
 - Replaced TinyMCE with Quill for rich-text editing.
 - View mode now renders through a read-only Quill instance instead of hand-built HTML,
   so headers and lists display correctly and link hrefs can no longer inject script.
