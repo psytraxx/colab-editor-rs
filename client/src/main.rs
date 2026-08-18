@@ -5,7 +5,6 @@ use automerge::{
 use web_sys::{console::log_1, WebSocket, MessageEvent, CloseEvent, ErrorEvent};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -31,9 +30,19 @@ enum WsMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct UserState {
     user_id: String,
-    user_name: String,
     online: bool,
     editing: bool,
+}
+
+#[derive(Serialize)]
+struct TinyMceConfig {
+    selector: &'static str,
+    inline: bool,
+    menubar: bool,
+    plugins: &'static str,
+    toolbar: &'static str,
+    block_formats: &'static str,
+    license_key: &'static str,
 }
 
 #[wasm_bindgen]
@@ -78,7 +87,6 @@ struct App {
     tinymce_initialized: bool,
     users: HashMap<String, UserState>,
     my_id: Option<String>,
-    my_name: Option<String>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -94,8 +102,6 @@ enum Msg {
     WsError(String),
     UpdateField(&'static str, String),
     ToggleMode,
-    LocalUpdate,
-    InitTinyMCE,
     SyncBodyFromTinyMCE,
 }
 
@@ -129,8 +135,9 @@ impl Component for App {
             let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
                 if let Some(txt) = e.data().as_string() {
                     // Log abbreviated message to avoid console spam with large snapshots
-                    let log_txt = if txt.len() > 100 {
-                        format!("{}...", &txt[..100])
+                    let log_txt = if txt.chars().count() > 100 {
+                        let head: String = txt.chars().take(100).collect();
+                        format!("{}...", head)
                     } else {
                         txt.clone()
                     };
@@ -186,32 +193,23 @@ impl Component for App {
             tinymce_initialized: false,
             users: HashMap::new(),
             my_id: None,
-            my_name: None,
         }
     }
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::WsMessage(ws_msg) => {
                 match ws_msg {
                     WsMessage::Init { user_id, snapshot, users } => {
                         log_1(&format!("[WS] Init! My ID: {}", user_id).into());
                         self.my_id = Some(user_id.clone());
-                        self.my_name = Some(user_id.clone());
 
                         // Load snapshot if present
                         if let Some(data) = snapshot {
-                             if let Ok(doc) = AutoCommit::load(&data) {
-                                 self.doc = doc;
-                                 if self.tinymce_initialized {
-                                     if let Some(editor) = get("body-editor") {
-                                         let body = self.get_str(DOC_KEY_BODY);
-                                         editor.set_content(&body);
-                                     }
-                                 }
-                             } else {
-                                 log_1(&"[WS] Failed to load snapshot".into());
-                             }
+                            match AutoCommit::load(&data) {
+                                Ok(doc) => { self.apply_incoming_doc(doc, true); }
+                                Err(_) => log_1(&"[WS] Failed to load snapshot".into()),
+                            }
                         }
 
                         // Populate users
@@ -221,53 +219,24 @@ impl Component for App {
                                 self.users.insert(user.user_id.clone(), user);
                             }
                         }
-                        
-                        // Add self to users list (if not in list from server)
+
+                        // Add self to users list
                         self.users.insert(user_id.clone(), UserState {
-                            user_id: user_id.clone(),
-                            user_name: user_id,
+                            user_id,
                             online: true,
                             editing: false,
                         });
-                        
+
                         true
                     }
                     WsMessage::Content(data) => {
                         log_1(&format!("[WS] Received Content update, {} bytes", data.len()).into());
-                        if let Ok(mut remote_doc) = AutoCommit::load(&data) {
-                            let body_before = self.get_str(DOC_KEY_BODY);
-                            
-                            // Merge remote state into local
-                            if let Err(e) = self.doc.merge(&mut remote_doc) {
-                                log_1(&format!("[WS] Merge failed: {:?}", e).into());
-                                return false;
+                        match AutoCommit::load(&data) {
+                            Ok(remote_doc) => self.apply_incoming_doc(remote_doc, false),
+                            Err(_) => {
+                                log_1(&"[WS] Failed to load remote content".into());
+                                false
                             }
-                            
-                            let body_after = self.get_str(DOC_KEY_BODY);
-
-                            // Update TinyMCE if body changed from remote and we're in edit mode
-                            if body_before != body_after && self.tinymce_initialized {
-                                if let Some(editor) = get("body-editor") {
-                                    let current_content = editor.get_content();
-                                    if body_after != current_content {
-                                        if editor.has_focus() {
-                                            // Save cursor position before updating content
-                                            let selection = editor.selection();
-                                            let bookmark = selection.get_bookmark(2);
-                                            editor.set_content(&body_after);
-                                            // Restore cursor position
-                                            let selection = editor.selection();
-                                            selection.move_to_bookmark(&bookmark);
-                                        } else {
-                                            editor.set_content(&body_after);
-                                        }
-                                    }
-                                }
-                            }
-                            true
-                        } else {
-                            log_1(&"[WS] Failed to load remote content".into());
-                            false
                         }
                     }
                     WsMessage::UserState(user_state) => {
@@ -289,94 +258,38 @@ impl Component for App {
                 false
             }
             Msg::UpdateField(key, value) => {
-                // Get current value to check if it actually changed
-                let current = self.get_str(key);
-                if current != value {
-                    self.doc.put(automerge::ROOT, key, value).unwrap();
-                    // Increment version only when content actually changes
-                    let current_version = self.get_u64(DOC_KEY_VERSION);
-                    self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                    ctx.link().send_message(Msg::LocalUpdate);
-                    true
-                } else {
-                    false
-                }
+                self.set_field(key, value)
             }
             Msg::ToggleMode => {
                 self.mode = match self.mode {
                     Mode::View => {
-                        // Initialize TinyMCE after switching to edit mode
-                        ctx.link().send_message(Msg::InitTinyMCE);
-                        // Broadcast that we're entering edit mode
-                        self.broadcast_my_state(true);
-                        // Update our own user state
-                        if let Some(my_id) = &self.my_id {
-                            if let Some(user) = self.users.get_mut(my_id) {
-                                user.editing = true;
-                            }
-                        }
+                        self.set_editing(true);
                         Mode::Edit
                     }
                     Mode::Edit => {
-                        // Sync body from TinyMCE before switching to view
+                        // Sync body from TinyMCE before tearing it down
                         if self.tinymce_initialized {
-                            if let Some(editor) = get("body-editor") {
-                                let content = editor.get_content();
-                                let current = self.get_str(DOC_KEY_BODY);
-                                if current != content {
-                                    self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
-                                    let current_version = self.get_u64(DOC_KEY_VERSION);
-                                    self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                                    ctx.link().send_message(Msg::LocalUpdate);
-                                }
-                            }
+                            self.sync_body_from_tinymce();
                             remove("#body-editor");
                             self.tinymce_initialized = false;
                         }
-                        // Broadcast that we're leaving edit mode
-                        self.broadcast_my_state(false);
-                        // Update our own user state
-                        if let Some(my_id) = &self.my_id {
-                            if let Some(user) = self.users.get_mut(my_id) {
-                                user.editing = false;
-                            }
-                        }
+                        self.set_editing(false);
                         Mode::View
                     }
                 };
                 true
             }
-            Msg::InitTinyMCE => {
-                self.init_tinymce(ctx);
-                false
-            }
             Msg::SyncBodyFromTinyMCE => {
-                if let Some(editor) = get("body-editor") {
-                    let content = editor.get_content();
-                    let current = self.get_str(DOC_KEY_BODY);
-                    if current != content {
-                        self.doc.put(automerge::ROOT, DOC_KEY_BODY, content).unwrap();
-                        let current_version = self.get_u64(DOC_KEY_VERSION);
-                        self.doc.put(automerge::ROOT, DOC_KEY_VERSION, current_version + 1).unwrap();
-                        ctx.link().send_message(Msg::LocalUpdate);
-                    }
-                }
+                self.sync_body_from_tinymce();
                 false
             }
-            Msg::LocalUpdate => {
-                // Send FULL content (state-based sync)
-                if let Some(ws) = &self.ws {
-                    let data = self.doc.save();
-                    log_1(&format!("[WS] Sending Content update, {} bytes", data.len()).into());
-                    let ws_msg = WsMessage::Content(data);
-                    if let Ok(json) = serde_json::to_string(&ws_msg) {
-                        let _ = ws.send_with_str(&json);
-                    }
-                } else {
-                    log_1(&"[WS] No WebSocket connection!".into());
-                }
-                false
-            }
+        }
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, _first_render: bool) {
+        // Initialize TinyMCE only once the edit-mode DOM node actually exists.
+        if self.mode == Mode::Edit && !self.tinymce_initialized {
+            self.init_tinymce(ctx);
         }
     }
 
@@ -385,9 +298,6 @@ impl Component for App {
         let keywords = self.get_str(DOC_KEY_KEYWORDS);
         let body = self.get_str(DOC_KEY_BODY);
         let version = self.get_u64(DOC_KEY_VERSION);
-
-        // log_1(&format!("[VIEW] Rendering - title: '{}', keywords: '{}', body: '{}', version: {}",
-        //    title, keywords, &body[..body.len().min(50)], version).into());
 
         html! {
             <div>
@@ -414,7 +324,7 @@ impl Component for App {
                             };
                             html! {
                                 <span class={class}>
-                                    { &user.user_name }
+                                    { &user.user_id }
                                 </span>
                             }
                         })}
@@ -482,132 +392,178 @@ impl Component for App {
 }
 
 impl App {
-    fn get_str(&self, key: &str) -> String {
-        self.doc
-            .get(automerge::ROOT, key)
-            .ok()
-            .flatten()
-            .map(|(v, _)| match v {
-                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Str(s))) => s.into(),
-                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Str(s))) => s.to_string(),
-                automerge::Value::Scalar(s) => s.to_string(),
-                automerge::Value::Object(_) => String::new(),
-            })
-            .unwrap_or_default()
+    fn get_scalar(&self, key: &str) -> Option<automerge::ScalarValue> {
+        match self.doc.get(automerge::ROOT, key).ok().flatten()?.0 {
+            automerge::Value::Scalar(s) => Some(s.into_owned()),
+            automerge::Value::Object(_) => None,
+        }
     }
-    
+
+    fn get_str(&self, key: &str) -> String {
+        match self.get_scalar(key) {
+            Some(automerge::ScalarValue::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    }
+
     fn get_u64(&self, key: &str) -> u64 {
-         self.doc
-            .get(automerge::ROOT, key)
-            .ok()
-            .flatten()
-            .map(|(v, _)| match v {
-                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Uint(u))) => u,
-                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Uint(u))) => *u,
-                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::Int(i))) => i as u64,
-                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::Int(i))) => *i as u64,
-                automerge::Value::Scalar(std::borrow::Cow::Owned(automerge::ScalarValue::F64(f))) => f as u64,
-                automerge::Value::Scalar(std::borrow::Cow::Borrowed(automerge::ScalarValue::F64(f))) => *f as u64,
-                _ => 0,
-            })
-            .unwrap_or(0)
+        match self.get_scalar(key) {
+            Some(automerge::ScalarValue::Uint(u)) => u,
+            Some(automerge::ScalarValue::Int(i)) => i as u64,
+            Some(automerge::ScalarValue::F64(f)) => f as u64,
+            _ => 0,
+        }
     }
 
     fn handle_user_state(&mut self, user_state: UserState) -> bool {
-        log_1(&format!(
-            "[CLIENT] Received UserState: id={} name={} online={}",
-            user_state.user_id, user_state.user_name, user_state.online
-        ).into());
-        
-        // Don't overwrite our own state from server - we manage it locally
-        let dominated_by_local = self.my_id.as_ref() == Some(&user_state.user_id);
-        
+        // We manage our own presence locally; ignore echoes of it from the server.
+        if self.my_id.as_ref() == Some(&user_state.user_id) {
+            return false;
+        }
         if user_state.online {
-            if dominated_by_local {
-                // Only update our entry if we don't have one yet
-                self.users.entry(user_state.user_id.clone()).or_insert(user_state);
-            } else {
-                self.users.insert(user_state.user_id.clone(), user_state);
-            }
+            self.users.insert(user_state.user_id.clone(), user_state);
         } else {
             self.users.remove(&user_state.user_id);
         }
-        
-        log_1(&format!(
-            "[CLIENT] Total users in map: {}",
-            self.users.len()
-        ).into());
-        
         true
     }
 
+    /// Set a document field, bump the version, and broadcast the new snapshot.
+    /// Returns whether the field actually changed.
+    fn set_field(&mut self, key: &'static str, value: String) -> bool {
+        if self.get_str(key) == value {
+            return false;
+        }
+        self.doc.put(automerge::ROOT, key, value).unwrap();
+        let version = self.get_u64(DOC_KEY_VERSION);
+        self.doc.put(automerge::ROOT, DOC_KEY_VERSION, version + 1).unwrap();
+        self.broadcast_doc();
+        true
+    }
+
+    fn sync_body_from_tinymce(&mut self) {
+        if let Some(editor) = get("body-editor") {
+            self.set_field(DOC_KEY_BODY, editor.get_content());
+        }
+    }
+
+    /// Merge or replace an incoming document and refresh the editor if the body changed.
+    fn apply_incoming_doc(&mut self, mut incoming: AutoCommit, replace: bool) -> bool {
+        let body_before = self.get_str(DOC_KEY_BODY);
+        if replace {
+            self.doc = incoming;
+        } else if let Err(e) = self.doc.merge(&mut incoming) {
+            log_1(&format!("[WS] Merge failed: {:?}", e).into());
+            return false;
+        }
+        let body_after = self.get_str(DOC_KEY_BODY);
+        if body_before != body_after && self.tinymce_initialized {
+            self.refresh_editor_body(&body_after);
+        }
+        true
+    }
+
+    fn refresh_editor_body(&self, body: &str) {
+        let Some(editor) = get("body-editor") else { return };
+        if editor.get_content() == body {
+            return;
+        }
+        if editor.has_focus() {
+            // Preserve the cursor position across the content swap.
+            let bookmark = editor.selection().get_bookmark(2);
+            editor.set_content(body);
+            editor.selection().move_to_bookmark(&bookmark);
+        } else {
+            editor.set_content(body);
+        }
+    }
+
+    fn set_editing(&mut self, editing: bool) {
+        self.broadcast_my_state(editing);
+        if let Some(my_id) = &self.my_id {
+            if let Some(user) = self.users.get_mut(my_id) {
+                user.editing = editing;
+            }
+        }
+    }
+
+    fn send_ws(&self, msg: &WsMessage) {
+        match &self.ws {
+            Some(ws) => {
+                if let Ok(json) = serde_json::to_string(msg) {
+                    let _ = ws.send_with_str(&json);
+                }
+            }
+            None => log_1(&"[WS] No WebSocket connection!".into()),
+        }
+    }
+
+    fn broadcast_doc(&mut self) {
+        let data = self.doc.save();
+        log_1(&format!("[WS] Sending Content update, {} bytes", data.len()).into());
+        self.send_ws(&WsMessage::Content(data));
+    }
+
     fn broadcast_my_state(&self, editing: bool) {
-        if let (Some(my_id), Some(my_name), Some(ws)) = (&self.my_id, &self.my_name, &self.ws) {
-            let user_state = UserState {
+        if let Some(my_id) = &self.my_id {
+            self.send_ws(&WsMessage::UserState(UserState {
                 user_id: my_id.clone(),
-                user_name: my_name.clone(),
                 online: true,
                 editing,
-            };
-            let ws_msg = WsMessage::UserState(user_state);
-            if let Ok(json) = serde_json::to_string(&ws_msg) {
-                let _ = ws.send_with_str(&json);
-            }
+            }));
         }
     }
 
     fn init_tinymce(&mut self, ctx: &Context<Self>) {
-        if !self.tinymce_initialized {
-            let link = ctx.link().clone();
-            let body_content = self.get_str(DOC_KEY_BODY);
-            
-            // Delay initialization to ensure DOM is ready
-            spawn_local(async move {
-                gloo_timers::future::TimeoutFuture::new(50).await;
-                
-                let options = js_sys::Object::new();
-                js_sys::Reflect::set(&options, &"selector".into(), &"#body-editor".into()).unwrap();
-                js_sys::Reflect::set(&options, &"inline".into(), &true.into()).unwrap();
-                // enable menubar so users can access format/insert options
-                js_sys::Reflect::set(&options, &"menubar".into(), &true.into()).unwrap();
-                // add common structural plugins
-                js_sys::Reflect::set(&options, &"plugins".into(), &"lists link image table code".into()).unwrap();
-                // richer toolbar including format selector, alignment and indenting
-                js_sys::Reflect::set(&options, &"toolbar".into(), &"formatselect | undo redo | bold italic underline | alignleft aligncenter alignright | outdent indent | bullist numlist | link image | code".into()).unwrap();
-                // define available block formats (paragraphs and headings)
-                js_sys::Reflect::set(&options, &"block_formats".into(), &"Paragraph=p;Heading 1=h1;Heading 2=h2;Heading 3=h3;Heading 4=h4".into()).unwrap();
-                js_sys::Reflect::set(&options, &"license_key".into(), &"gpl".into()).unwrap();
-                
-                // Setup callback for changes
-                let link_clone = link.clone();
-                let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
-                    let link_inner = link_clone.clone();
-                    let on_change = Closure::wrap(Box::new(move || {
-                        link_inner.send_message(Msg::SyncBodyFromTinyMCE);
-                    }) as Box<dyn Fn()>);
-                    
-                    // Register change and keyup events
-                    let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
-                    let on_fn = on_method.unchecked_into::<js_sys::Function>();
-                    let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
-                    let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
-                    on_change.forget();
-                }) as Box<dyn Fn(JsValue)>);
-                
-                js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
-                setup_fn.forget();
-                
-                init(&options.into());
-                
-                // Set initial content after a brief delay
-                gloo_timers::future::TimeoutFuture::new(100).await;
-                if let Some(editor) = get("body-editor") {
-                    editor.set_content(&body_content);
-                }
-            });
-            
-            self.tinymce_initialized = true;
+        if self.tinymce_initialized {
+            return;
         }
+        self.tinymce_initialized = true;
+
+        let link = ctx.link().clone();
+        let body_content = self.get_str(DOC_KEY_BODY);
+
+        let config = TinyMceConfig {
+            selector: "#body-editor",
+            inline: true,
+            menubar: true,
+            plugins: "lists link image table code",
+            toolbar: "formatselect | undo redo | bold italic underline | alignleft aligncenter alignright | outdent indent | bullist numlist | link image | code",
+            block_formats: "Paragraph=p;Heading 1=h1;Heading 2=h2;Heading 3=h3;Heading 4=h4",
+            license_key: "gpl",
+        };
+        let options: js_sys::Object = serde_wasm_bindgen::to_value(&config)
+            .unwrap()
+            .unchecked_into();
+
+        let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
+            let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
+            let on_fn = on_method.unchecked_into::<js_sys::Function>();
+
+            // Set the initial content once the editor reports it is ready.
+            let body = body_content.clone();
+            let on_init = Closure::wrap(Box::new(move || {
+                if let Some(ed) = get("body-editor") {
+                    ed.set_content(&body);
+                }
+            }) as Box<dyn Fn()>);
+            let _ = on_fn.call2(&editor, &"init".into(), on_init.as_ref().unchecked_ref());
+            on_init.forget();
+
+            // Push local edits into the Automerge document.
+            let link_inner = link.clone();
+            let on_change = Closure::wrap(Box::new(move || {
+                link_inner.send_message(Msg::SyncBodyFromTinyMCE);
+            }) as Box<dyn Fn()>);
+            let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
+            let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
+            on_change.forget();
+        }) as Box<dyn Fn(JsValue)>);
+
+        js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
+        setup_fn.forget();
+
+        init(&options.into());
     }
 }
 

@@ -29,14 +29,10 @@ export default {
 // Durable Object for managing editor state and connections
 export class EditorRoom {
   private state: DurableObjectState;
-  private sessions: Map<WebSocket, Session>;
-  private users: Map<string, UserState>;
   private snapshot: Uint8Array | null;
 
   constructor(state: DurableObjectState) {
     this.state = state;
-    this.sessions = new Map();
-    this.users = new Map();
     this.snapshot = null;
   }
 
@@ -47,6 +43,15 @@ export class EditorRoom {
       this.snapshot = stored;
       console.log('Loaded snapshot from storage');
     }
+  }
+
+  // Presence is derived from the currently connected sockets so it survives
+  // Durable Object hibernation (no in-memory session map to lose).
+  private userStates(): UserState[] {
+    return this.state.getWebSockets().map((ws) => {
+      const att = ws.deserializeAttachment() as Attachment;
+      return { user_id: att.userId, online: true, editing: att.editing };
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -62,43 +67,26 @@ export class EditorRoom {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Accept WebSocket connection
+    // Accept WebSocket connection (hibernation-aware)
     this.state.acceptWebSocket(server);
 
-    // Generate user ID
+    // Attach session data to the socket so it can be recovered after hibernation
     const userId = this.generateUserId();
-    const userName = userId;
+    const attachment: Attachment = { userId, editing: false };
+    server.serializeAttachment(attachment);
 
-    // Create session
-    const session: Session = {
-      userId,
-      userName,
-      ws: server
-    };
-
-    this.sessions.set(server, session);
-
-    // Create initial user state
-    const userState: UserState = {
-      user_id: userId,
-      user_name: userName,
-      online: true,
-      editing: false
-    };
-    this.users.set(userId, userState);
-
-    // Send Init message
+    // Send Init message (users list must include the new socket)
     this.send(server, {
       Init: {
         user_id: userId,
         snapshot: this.snapshot ? Array.from(this.snapshot) : null,
-        users: Array.from(this.users.values())
+        users: this.userStates()
       }
     });
 
     // Broadcast new user to others
     this.broadcast({
-      UserState: userState
+      UserState: { user_id: userId, online: true, editing: false }
     }, server);
 
     return new Response(null, {
@@ -108,8 +96,8 @@ export class EditorRoom {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const session = this.sessions.get(ws);
-    if (!session) return;
+    const attachment = ws.deserializeAttachment() as Attachment | null;
+    if (!attachment) return;
 
     try {
       const data = typeof message === 'string' ? message : new TextDecoder().decode(message);
@@ -117,14 +105,11 @@ export class EditorRoom {
 
       if (msg.Content) {
         // Content = Full Snapshot
-        // 1. Update local state
         this.snapshot = new Uint8Array(msg.Content);
-        // 2. Persist
         await this.state.storage.put('document', this.snapshot);
-        // 3. Broadcast to others (exclude sender)
         this.broadcast({ Content: msg.Content }, ws);
       } else if (msg.UserState) {
-        this.handleUserState(session, msg.UserState);
+        this.handleUserState(ws, attachment, msg.UserState);
       }
     } catch (err) {
       console.error('Error handling message:', err);
@@ -132,39 +117,22 @@ export class EditorRoom {
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
-    const session = this.sessions.get(ws);
-    if (!session) return;
+    const attachment = ws.deserializeAttachment() as Attachment | null;
+    if (!attachment) return;
 
-    console.log(`User ${session.userId} disconnected`);
-
-    // Mark user as offline
-    const userState = this.users.get(session.userId);
-    if (userState) {
-      userState.online = false;
-      this.broadcast({
-        UserState: userState
-      });
-      this.users.delete(session.userId);
-    }
-
-    this.sessions.delete(ws);
+    console.log(`User ${attachment.userId} disconnected`);
+    this.broadcast({
+      UserState: { user_id: attachment.userId, online: false, editing: false }
+    });
   }
 
-  private handleUserState(session: Session, incomingState: UserState): void {
-    // Update user state with editing flag from incoming state
-    const userState: UserState = {
-      user_id: session.userId,
-      user_name: session.userName,
-      online: true,
-      editing: incomingState.editing ?? false
-    };
+  private handleUserState(ws: WebSocket, attachment: Attachment, incomingState: UserState): void {
+    attachment.editing = incomingState.editing ?? false;
+    ws.serializeAttachment(attachment);
 
-    this.users.set(session.userId, userState);
-
-    // Broadcast to all clients (exclude sender)
     this.broadcast({
-      UserState: userState
-    }, session.ws);
+      UserState: { user_id: attachment.userId, online: true, editing: attachment.editing }
+    }, ws);
   }
 
   private send(ws: WebSocket, message: any): void {
@@ -177,7 +145,7 @@ export class EditorRoom {
 
   private broadcast(message: any, exclude?: WebSocket): void {
     const msgString = JSON.stringify(message);
-    for (const [ws, session] of this.sessions.entries()) {
+    for (const ws of this.state.getWebSockets()) {
       if (ws !== exclude) {
         try {
           ws.send(msgString);
@@ -199,15 +167,13 @@ export class EditorRoom {
 }
 
 // Type definitions
-interface Session {
+interface Attachment {
   userId: string;
-  userName: string;
-  ws: WebSocket;
+  editing: boolean;
 }
 
 interface UserState {
   user_id: string;
-  user_name: string;
   online: boolean;
   editing: boolean;
 }

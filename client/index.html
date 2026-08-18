@@ -9,10 +9,6 @@
     <style>
       body { max-width: 800px; margin: 0 auto; padding: 20px; }
       .field { margin-bottom: 15px; }
-      .version { color: var(--muted-color); font-size: 0.8em; }
-      .mode-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; color: white; font-weight: bold; margin-bottom: 1rem; }
-      .mode-view { background-color: var(--pico-primary); }
-      .mode-edit { background-color: #f57c00; }
       .inline-editor {
         min-height: 200px;
         border: 1px solid var(--pico-form-element-border-color);
@@ -50,63 +46,10 @@
         color: #333;
         border: 1px solid #ddd;
       }
-      .user-badge.active {
-        background-color: #4caf50;
-        color: white;
-        border-color: #4caf50;
-      }
       .user-badge.editing {
         background-color: #4caf50;
         color: white;
         border-color: #4caf50;
-      }
-      
-      /* Active editors panel */
-      .active-editors {
-        margin-bottom: 1rem;
-        padding: 0.75rem;
-        background: var(--pico-card-background-color);
-        border-radius: var(--pico-border-radius);
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-      }
-      .editor-tag {
-        padding: 4px 8px;
-        border-radius: 4px;
-        background-color: #4caf50;
-        color: white;
-        font-size: 12px;
-      }
-      
-      /* Cursor indicators */
-      .field-with-cursors {
-        position: relative;
-      }
-      .input-wrapper {
-        position: relative;
-      }
-      .cursor-indicator {
-        position: absolute;
-        top: -20px;
-        right: 0;
-        padding: 2px 6px;
-        border-radius: 4px;
-        background-color: #4caf50;
-        color: white;
-        font-size: 11px;
-        font-weight: 500;
-        white-space: nowrap;
-        z-index: 10;
-        animation: fade-in 0.2s ease-in;
-      }
-      .cursor-indicator:nth-child(3) { right: auto; left: 0; }
-      .cursor-indicator:nth-child(4) { right: 80px; }
-      
-      @keyframes fade-in {
-        from { opacity: 0; transform: translateY(5px); }
-        to { opacity: 1; transform: translateY(0); }
       }
     </style>
   </head>
