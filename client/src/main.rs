@@ -1,108 +1,72 @@
-use automerge::{
-    transaction::Transactable,
-    AutoCommit, ReadDoc,
-};
-use web_sys::{console::log_1, WebSocket, MessageEvent, CloseEvent, ErrorEvent};
+mod doc;
+mod marks;
+mod protocol;
+mod quill;
+
+use crate::doc::Doc;
+use crate::marks::{json_from_scalar, MARK_NAMES};
+use crate::protocol::{UserState, WsMessage, DOC_KEY_KEYWORDS, DOC_KEY_TITLE, DOC_KEY_VERSION};
+use crate::quill::{Delta, Quill, QuillConfig, QuillModules, Toolbar};
+use automerge::{patches::PatchAction, AutoCommit, ObjId};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
+use web_sys::{console::log_1, CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 use yew::prelude::*;
-use serde::{Deserialize, Serialize};
 
-// Document field keys
-const DOC_KEY_TITLE: &str = "title";
-const DOC_KEY_BODY: &str = "body";
-const DOC_KEY_KEYWORDS: &str = "keywords";
-const DOC_KEY_VERSION: &str = "version";
+/// Reconnect backoff bounds, in milliseconds.
+const RECONNECT_BASE_MS: u32 = 500;
+const RECONNECT_MAX_MS: u32 = 15_000;
 
-// WebSocket message types
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "PascalCase")]
-enum WsMessage {
-    Init {
-        user_id: String,
-        snapshot: Option<Vec<u8>>,
-        users: Vec<UserState>,
-    },
-    Content(Vec<u8>),
-    UserState(UserState),
+/// The editor is mounted in both modes; the only difference is whether it is
+/// editable and carries a toolbar. Holding the `Quill` handle inside the mode
+/// makes "in edit mode but no editor" unrepresentable.
+enum Mode {
+    View(Option<Quill>),
+    Edit(Quill),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct UserState {
-    user_id: String,
-    online: bool,
-    editing: bool,
-}
-
-#[derive(Serialize)]
-struct TinyMceConfig {
-    selector: &'static str,
-    inline: bool,
-    menubar: bool,
-    plugins: &'static str,
-    toolbar: &'static str,
-    block_formats: &'static str,
-    license_key: &'static str,
-}
-
-#[wasm_bindgen]
-extern "C" {
-    // TinyMCE
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn init(options: &JsValue);
-
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn get(id: &str) -> Option<TinyMCEEditor>;
-
-    #[wasm_bindgen(js_namespace = tinymce)]
-    fn remove(selector: &str);
-
-    type TinyMCEEditor;
-
-    #[wasm_bindgen(method, js_name = getContent)]
-    fn get_content(this: &TinyMCEEditor) -> String;
-
-    #[wasm_bindgen(method, js_name = setContent)]
-    fn set_content(this: &TinyMCEEditor, content: &str);
-
-    #[wasm_bindgen(method, js_name = hasFocus)]
-    fn has_focus(this: &TinyMCEEditor) -> bool;
-
-    #[wasm_bindgen(method, getter)]
-    fn selection(this: &TinyMCEEditor) -> TinyMCESelection;
-
-    type TinyMCESelection;
-
-    #[wasm_bindgen(method, js_name = getBookmark)]
-    fn get_bookmark(this: &TinyMCESelection, bookmark_type: i32) -> JsValue;
-
-    #[wasm_bindgen(method, js_name = moveToBookmark)]
-    fn move_to_bookmark(this: &TinyMCESelection, bookmark: &JsValue);
+impl Mode {
+    fn editor(&self) -> Option<&Quill> {
+        match self {
+            Mode::Edit(q) => Some(q),
+            Mode::View(q) => q.as_ref(),
+        }
+    }
 }
 
 struct App {
-    doc: AutoCommit,
+    doc: Doc,
     mode: Mode,
     ws: Option<WebSocket>,
-    tinymce_initialized: bool,
     users: HashMap<String, UserState>,
     my_id: Option<String>,
-}
-
-#[derive(PartialEq, Clone)]
-enum Mode {
-    View,
-    Edit,
+    reconnect_delay_ms: u32,
+    /// Which mode the user has selected. `mode` lags this by one render, since
+    /// the editor can only be mounted after Yew has produced `#body-editor`.
+    want_edit: bool,
 }
 
 enum Msg {
     WsMessage(WsMessage),
-    WsConnected,
+    WsOpened,
     WsClosed,
     WsError(String),
+    Reconnect,
     UpdateField(&'static str, String),
-    ToggleMode,
-    SyncBodyFromTinyMCE,
+    SetEditMode(bool),
+    QuillTextChanged,
+}
+
+fn ws_url() -> &'static str {
+    let local = web_sys::window()
+        .and_then(|w| w.location().hostname().ok())
+        .map(|h| h == "localhost" || h == "127.0.0.1")
+        .unwrap_or(false);
+    if local {
+        "ws://localhost:8787/ws"
+    } else {
+        "wss://colab-editor-rs.dynamicflash.workers.dev/ws"
+    }
 }
 
 impl Component for App {
@@ -110,211 +74,99 @@ impl Component for App {
     type Properties = ();
 
     fn create(ctx: &Context<Self>) -> Self {
-        // Initialize EMPTY document - server is source of truth
-        let doc = AutoCommit::new();
-
-        // Connect to WebSocket server
-        // Automatically detect environment
-        let ws_url = if web_sys::window()
-            .and_then(|w| w.location().hostname().ok())
-            .map(|h| h == "localhost" || h == "127.0.0.1")
-            .unwrap_or(false)
-        {
-            "ws://localhost:8787/ws"
-        } else {
-            "wss://colab-editor-rs.dynamicflash.workers.dev/ws"
-        };
-
-        let ws = WebSocket::new(ws_url).ok();
-
-        if let Some(ref websocket) = ws {
-            let link = ctx.link().clone();
-
-            // Setup onmessage
-            let link_msg = link.clone();
-            let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
-                if let Some(txt) = e.data().as_string() {
-                    // Log abbreviated message to avoid console spam with large snapshots
-                    let log_txt = if txt.chars().count() > 100 {
-                        let head: String = txt.chars().take(100).collect();
-                        format!("{}...", head)
-                    } else {
-                        txt.clone()
-                    };
-                    log_1(&format!("[WS] Received: {}", log_txt).into());
-                    
-                    match serde_json::from_str::<WsMessage>(&txt) {
-                        Ok(msg) => {
-                            link_msg.send_message(Msg::WsMessage(msg));
-                        }
-                        Err(e) => {
-                            log_1(&format!("[WS] Failed to parse message: {:?}", e).into());
-                        }
-                    }
-                }
-            }) as Box<dyn FnMut(MessageEvent)>);
-            websocket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-            onmessage.forget();
-
-            // Setup onopen
-            let link_open = link.clone();
-            let onopen = Closure::wrap(Box::new(move |_| {
-                log_1(&"[WS] Connected!".into());
-                link_open.send_message(Msg::WsConnected);
-            }) as Box<dyn FnMut(JsValue)>);
-            websocket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-            onopen.forget();
-
-            // Setup onclose
-            let link_close = link.clone();
-            let onclose = Closure::wrap(Box::new(move |_: CloseEvent| {
-                log_1(&"[WS] Disconnected".into());
-                link_close.send_message(Msg::WsClosed);
-            }) as Box<dyn FnMut(CloseEvent)>);
-            websocket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
-            onclose.forget();
-
-            // Setup onerror
-            let link_error = link.clone();
-            let onerror = Closure::wrap(Box::new(move |e: ErrorEvent| {
-                log_1(&format!("[WS] Error: {:?}", e.message()).into());
-                link_error.send_message(Msg::WsError(e.message()));
-            }) as Box<dyn FnMut(ErrorEvent)>);
-            websocket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-            onerror.forget();
-        } else {
-            log_1(&"[WS] Failed to create WebSocket".into());
-        }
-
-        Self {
-            doc,
-            mode: Mode::View,
-            ws,
-            tinymce_initialized: false,
+        let mut app = Self {
+            // Start EMPTY - the server is the source of truth.
+            doc: Doc::new(),
+            mode: Mode::View(None),
+            ws: None,
             users: HashMap::new(),
             my_id: None,
-        }
+            reconnect_delay_ms: RECONNECT_BASE_MS,
+            want_edit: false,
+        };
+        app.connect(ctx);
+        app
     }
 
-    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
+    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::WsMessage(ws_msg) => {
-                match ws_msg {
-                    WsMessage::Init { user_id, snapshot, users } => {
-                        log_1(&format!("[WS] Init! My ID: {}", user_id).into());
-                        self.my_id = Some(user_id.clone());
-
-                        // Load snapshot if present
-                        if let Some(data) = snapshot {
-                            match AutoCommit::load(&data) {
-                                Ok(doc) => { self.apply_incoming_doc(doc, true); }
-                                Err(_) => log_1(&"[WS] Failed to load snapshot".into()),
-                            }
-                        }
-
-                        // Populate users
-                        self.users.clear();
-                        for user in users {
-                            if user.online {
-                                self.users.insert(user.user_id.clone(), user);
-                            }
-                        }
-
-                        // Add self to users list
-                        self.users.insert(user_id.clone(), UserState {
-                            user_id,
-                            online: true,
-                            editing: false,
-                        });
-
-                        true
-                    }
-                    WsMessage::Content(data) => {
-                        log_1(&format!("[WS] Received Content update, {} bytes", data.len()).into());
-                        match AutoCommit::load(&data) {
-                            Ok(remote_doc) => self.apply_incoming_doc(remote_doc, false),
-                            Err(_) => {
-                                log_1(&"[WS] Failed to load remote content".into());
-                                false
-                            }
-                        }
-                    }
-                    WsMessage::UserState(user_state) => {
-                        self.handle_user_state(user_state)
-                    }
-                }
-            }
-            Msg::WsConnected => {
-                log_1(&"[WS] WebSocket connected!".into());
+            Msg::WsMessage(ws_msg) => self.handle_ws_message(ws_msg),
+            Msg::WsOpened => {
+                log_1(&"[WS] Connected".into());
+                self.reconnect_delay_ms = RECONNECT_BASE_MS;
                 true
             }
             Msg::WsClosed => {
-                log_1(&"[WS] WebSocket closed".into());
+                log_1(&"[WS] Disconnected".into());
                 self.ws = None;
+                self.users.clear();
+                self.schedule_reconnect(ctx);
                 true
             }
             Msg::WsError(err) => {
-                log_1(&format!("[WS] WebSocket error: {}", err).into());
+                log_1(&format!("[WS] Error: {}", err).into());
+                false
+            }
+            Msg::Reconnect => {
+                if self.ws.is_none() {
+                    log_1(&"[WS] Reconnecting…".into());
+                    self.connect(ctx);
+                }
                 false
             }
             Msg::UpdateField(key, value) => {
-                self.set_field(key, value)
-            }
-            Msg::ToggleMode => {
-                self.mode = match self.mode {
-                    Mode::View => {
-                        self.set_editing(true);
-                        Mode::Edit
-                    }
-                    Mode::Edit => {
-                        // Sync body from TinyMCE before tearing it down
-                        if self.tinymce_initialized {
-                            self.sync_body_from_tinymce();
-                            remove("#body-editor");
-                            self.tinymce_initialized = false;
-                        }
-                        self.set_editing(false);
-                        Mode::View
-                    }
-                };
+                if !self.doc.set_field(key, value) {
+                    return false;
+                }
+                self.broadcast_doc();
                 true
             }
-            Msg::SyncBodyFromTinyMCE => {
-                self.sync_body_from_tinymce();
+            Msg::SetEditMode(edit) => {
+                if edit == self.want_edit {
+                    return false;
+                }
+                if !edit {
+                    // Sync any trailing edit before tearing the editor down.
+                    self.sync_body_from_editor();
+                }
+                self.teardown_quill();
+                self.want_edit = edit;
+                self.set_editing(edit);
+                true
+            }
+            Msg::QuillTextChanged => {
+                self.sync_body_from_editor();
                 false
             }
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, _first_render: bool) {
-        // Initialize TinyMCE only once the edit-mode DOM node actually exists.
-        if self.mode == Mode::Edit && !self.tinymce_initialized {
-            self.init_tinymce(ctx);
+        // Mount Quill only once the target DOM node actually exists. `want_edit`
+        // is what the last SetEditMode asked for; the mode still holds the old
+        // editor (or none) until we mount the matching one here.
+        if let Mode::View(None) = self.mode {
+            self.mount_quill(ctx, self.want_edit);
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let title = self.get_str(DOC_KEY_TITLE);
-        let keywords = self.get_str(DOC_KEY_KEYWORDS);
-        let body = self.get_str(DOC_KEY_BODY);
-        let version = self.get_u64(DOC_KEY_VERSION);
+        let title = self.doc.get_str(DOC_KEY_TITLE);
+        let keywords = self.doc.get_str(DOC_KEY_KEYWORDS);
+        let version = self.doc.get_u64(DOC_KEY_VERSION);
+        let edit = self.want_edit;
 
         html! {
-            <div>
-                <header>
-                    <hgroup>
-                        <h1>{ "Collaborative Editor" }</h1>
-                        <p>{ format!("v{}", version) }</p>
-                    </hgroup>
+            <main class="container">
+                <header class="app-header">
+                    <div class="connection-status">
+                        if self.ws.is_some() {
+                            <mark>{ format!("Connected — {} user(s)", self.users.len()) }</mark>
+                        } else {
+                            <span>{"Connecting to server…"}</span>
+                        }
+                    </div>
 
-                    // Connection status
-                    if self.ws.is_some() {
-                        <p><mark>{ format!("Connected - {} user(s)", self.users.len()) }</mark></p>
-                    } else {
-                        <p>{"Connecting to server..."}</p>
-                    }
-
-                    // Online users
                     <div class="online-users">
                         { for self.users.values().map(|user| {
                             let class = if user.editing {
@@ -322,35 +174,31 @@ impl Component for App {
                             } else {
                                 "user-badge inactive"
                             };
-                            html! {
-                                <span class={class}>
-                                    { &user.user_id }
-                                </span>
-                            }
+                            html! { <span class={class}>{ &user.user_id }</span> }
                         })}
                     </div>
                 </header>
 
-                if self.mode == Mode::View {
-                    <article class="view-mode">
-                        <header>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
-                                {"Edit"}
-                            </button>
-                        </header>
-                        <h2>{ title }</h2>
-                        <p><em>{ keywords }</em></p>
-                        <hr/>
-                        <div class="body-content">{Html::from_html_unchecked(body.into())}</div>
-                    </article>
-                } else {
-                    <article class="edit-mode">
-                        <header>
-                            <button onclick={ctx.link().callback(|_| Msg::ToggleMode)}>
-                                {"View"}
-                            </button>
-                        </header>
-                        
+                <div class="mode-switch-row">
+                    <fieldset class="mode-switch">
+                        <label>
+                            <input
+                                type="checkbox"
+                                role="switch"
+                                checked={edit}
+                                onclick={ctx.link().callback(|e: MouseEvent| {
+                                    let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                    Msg::SetEditMode(input.checked())
+                                })}
+                            />
+                            { if edit { "Edit mode" } else { "View mode" } }
+                        </label>
+                    </fieldset>
+                    <span class="version-pill">{ format!("v{}", version) }</span>
+                </div>
+
+                <article class={classes!("content-card", if edit { "edit-mode" } else { "view-mode" })}>
+                    if edit {
                         <div class="field">
                             <label>{ "Title" }</label>
                             <input
@@ -379,39 +227,131 @@ impl Component for App {
 
                         <div class="field">
                             <label>{ "Body" }</label>
-                            <div
-                                id="body-editor"
-                                class="inline-editor"
-                            ></div>
+                            <div id="body-editor" class="quill-editor"></div>
                         </div>
-                    </article>
-                }
-            </div>
+                    } else {
+                        <h2 class="view-title">{ title }</h2>
+                        if !keywords.trim().is_empty() {
+                            <div class="keyword-chips">
+                                { for keywords.split(',').map(|kw| kw.trim()).filter(|kw| !kw.is_empty()).map(|kw| {
+                                    html! { <span class="keyword-chip">{ kw }</span> }
+                                })}
+                            </div>
+                        }
+                        <div id="body-editor" class="quill-editor quill-readonly"></div>
+                    }
+                </article>
+            </main>
         }
     }
 }
 
 impl App {
-    fn get_scalar(&self, key: &str) -> Option<automerge::ScalarValue> {
-        match self.doc.get(automerge::ROOT, key).ok().flatten()?.0 {
-            automerge::Value::Scalar(s) => Some(s.into_owned()),
-            automerge::Value::Object(_) => None,
+    // --- connection ---------------------------------------------------
+
+    fn connect(&mut self, ctx: &Context<Self>) {
+        let Some(websocket) = WebSocket::new(ws_url()).ok() else {
+            log_1(&"[WS] Failed to create WebSocket".into());
+            self.schedule_reconnect(ctx);
+            return;
+        };
+        let link = ctx.link().clone();
+
+        let link_msg = link.clone();
+        let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
+            let Some(txt) = e.data().as_string() else {
+                return;
+            };
+            match serde_json::from_str::<WsMessage>(&txt) {
+                Ok(msg) => link_msg.send_message(Msg::WsMessage(msg)),
+                Err(e) => log_1(&format!("[WS] Failed to parse message: {:?}", e).into()),
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        websocket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+
+        let link_open = link.clone();
+        let onopen = Closure::wrap(Box::new(move |_| {
+            link_open.send_message(Msg::WsOpened);
+        }) as Box<dyn FnMut(JsValue)>);
+        websocket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        onopen.forget();
+
+        let link_close = link.clone();
+        let onclose = Closure::wrap(Box::new(move |_: CloseEvent| {
+            link_close.send_message(Msg::WsClosed);
+        }) as Box<dyn FnMut(CloseEvent)>);
+        websocket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+        onclose.forget();
+
+        let link_error = link.clone();
+        let onerror = Closure::wrap(Box::new(move |e: ErrorEvent| {
+            link_error.send_message(Msg::WsError(e.message()));
+        }) as Box<dyn FnMut(ErrorEvent)>);
+        websocket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        onerror.forget();
+
+        self.ws = Some(websocket);
+    }
+
+    /// Retry with exponential backoff. Without this a single network blip
+    /// leaves the client permanently disconnected while the UI still claims
+    /// to be connecting.
+    fn schedule_reconnect(&mut self, ctx: &Context<Self>) {
+        let delay = self.reconnect_delay_ms;
+        self.reconnect_delay_ms = (delay.saturating_mul(2)).min(RECONNECT_MAX_MS);
+
+        let link = ctx.link().clone();
+        let cb = Closure::once_into_js(move || link.send_message(Msg::Reconnect));
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.unchecked_ref(),
+                delay as i32,
+            );
         }
     }
 
-    fn get_str(&self, key: &str) -> String {
-        match self.get_scalar(key) {
-            Some(automerge::ScalarValue::Str(s)) => s.to_string(),
-            _ => String::new(),
-        }
-    }
+    fn handle_ws_message(&mut self, msg: WsMessage) -> bool {
+        match msg {
+            WsMessage::Init {
+                user_id,
+                snapshot,
+                users,
+            } => {
+                log_1(&format!("[WS] Init! My ID: {}", user_id).into());
+                self.my_id = Some(user_id.clone());
 
-    fn get_u64(&self, key: &str) -> u64 {
-        match self.get_scalar(key) {
-            Some(automerge::ScalarValue::Uint(u)) => u,
-            Some(automerge::ScalarValue::Int(i)) => i as u64,
-            Some(automerge::ScalarValue::F64(f)) => f as u64,
-            _ => 0,
+                if let Some(data) = snapshot {
+                    match AutoCommit::load(&data) {
+                        Ok(doc) => self.load_initial_doc(doc),
+                        Err(_) => log_1(&"[WS] Failed to load snapshot".into()),
+                    }
+                }
+
+                self.users.clear();
+                for user in users {
+                    if user.online {
+                        self.users.insert(user.user_id.clone(), user);
+                    }
+                }
+                self.users.insert(
+                    user_id.clone(),
+                    UserState {
+                        user_id,
+                        online: true,
+                        editing: self.want_edit,
+                    },
+                );
+                true
+            }
+            WsMessage::Content(data) => match AutoCommit::load(&data) {
+                Ok(remote) => self.merge_incoming_doc(remote),
+                Err(_) => {
+                    log_1(&"[WS] Failed to load remote content".into());
+                    false
+                }
+            },
+            WsMessage::UserState(user_state) => self.handle_user_state(user_state),
         }
     }
 
@@ -428,55 +368,147 @@ impl App {
         true
     }
 
-    /// Set a document field, bump the version, and broadcast the new snapshot.
-    /// Returns whether the field actually changed.
-    fn set_field(&mut self, key: &'static str, value: String) -> bool {
-        if self.get_str(key) == value {
-            return false;
-        }
-        self.doc.put(automerge::ROOT, key, value).unwrap();
-        let version = self.get_u64(DOC_KEY_VERSION);
-        self.doc.put(automerge::ROOT, DOC_KEY_VERSION, version + 1).unwrap();
-        self.broadcast_doc();
-        true
+    // --- document sync ------------------------------------------------
+
+    /// Adopt the server's snapshot wholesale. Unlike a merge there is no
+    /// shared history to diff against, so the editor is reloaded from scratch
+    /// rather than patched incrementally.
+    fn load_initial_doc(&mut self, incoming: AutoCommit) {
+        self.doc.replace_with(incoming);
+        self.reload_editor_contents();
     }
 
-    fn sync_body_from_tinymce(&mut self) {
-        if let Some(editor) = get("body-editor") {
-            self.set_field(DOC_KEY_BODY, editor.get_content());
-        }
-    }
-
-    /// Merge or replace an incoming document and refresh the editor if the body changed.
-    fn apply_incoming_doc(&mut self, mut incoming: AutoCommit, replace: bool) -> bool {
-        let body_before = self.get_str(DOC_KEY_BODY);
-        if replace {
-            self.doc = incoming;
-        } else if let Err(e) = self.doc.merge(&mut incoming) {
+    /// Merge a peer's document and apply only the body's changed span to the
+    /// live editor, preserving cursor position by construction instead of
+    /// replacing editor content wholesale.
+    fn merge_incoming_doc(&mut self, mut incoming: AutoCommit) -> bool {
+        let heads_before = self.doc.get_heads();
+        if let Err(e) = self.doc.merge(&mut incoming) {
             log_1(&format!("[WS] Merge failed: {:?}", e).into());
             return false;
         }
-        let body_after = self.get_str(DOC_KEY_BODY);
-        if body_before != body_after && self.tinymce_initialized {
-            self.refresh_editor_body(&body_after);
+        let heads_after = self.doc.get_heads();
+
+        let Some(body_obj) = self.doc.body_obj() else {
+            return true;
+        };
+        if self.mode.editor().is_none() {
+            return true;
+        }
+
+        let patches = self.doc.diff(&heads_before, &heads_after);
+        let mut marks_changed = false;
+        if let Some(editor) = self.mode.editor() {
+            for patch in &patches {
+                if patch.obj != body_obj {
+                    continue;
+                }
+                match &patch.action {
+                    PatchAction::SpliceText { index, value, .. } => {
+                        editor.insert_text(*index, &value.make_string(), "silent");
+                    }
+                    PatchAction::DeleteSeq { index, length } => {
+                        editor.delete_text(*index, *length, "silent");
+                    }
+                    PatchAction::Mark { .. } => marks_changed = true,
+                    _ => {}
+                }
+            }
+        }
+        if marks_changed {
+            self.resync_marks_to_editor(&body_obj);
         }
         true
     }
 
-    fn refresh_editor_body(&self, body: &str) {
-        let Some(editor) = get("body-editor") else { return };
-        if editor.get_content() == body {
+    /// Diff the editor's current text against the CRDT body and record only
+    /// the changed span as Automerge ops (via a Myers diff), instead of
+    /// replacing the whole field. Also resyncs formatting marks. Called on
+    /// every real user keystroke (text edit or toolbar formatting change).
+    fn sync_body_from_editor(&mut self) {
+        let Some(editor) = self.mode.editor() else {
+            return;
+        };
+        let delta: Delta =
+            serde_wasm_bindgen::from_value(editor.get_contents()).unwrap_or(Delta { ops: vec![] });
+        // Quill's document model always ends in a structural "\n" (its
+        // implicit final block), which `getContents()` includes as literal
+        // text. Strip exactly one trailing newline before treating this as
+        // the stored body — otherwise it accumulates by one "\n" on every
+        // sync, since Quill adds its own trailing "\n" again on next load
+        // without ever deduping existing ones.
+        let raw_text: String = delta
+            .ops
+            .iter()
+            .filter_map(|op| op.insert.as_deref())
+            .collect();
+        let text = raw_text.strip_suffix('\n').unwrap_or(&raw_text).to_string();
+
+        let text_changed = text != self.doc.get_body();
+        let body_obj = self.doc.body_obj_or_create();
+        // Automerge's mark()/unmark() always record ops, even when they have
+        // no net effect (same as put() — see set_field's equality guard), so
+        // rewrite_marks must only run when formatting has actually changed,
+        // not merely on every call (e.g. entering/leaving edit mode with no
+        // edits would otherwise still bump the version).
+        let marks_changed =
+            self.doc
+                .marks_differ_from_delta(&body_obj, &delta, text.chars().count());
+
+        if !text_changed && !marks_changed {
             return;
         }
-        if editor.has_focus() {
-            // Preserve the cursor position across the content swap.
-            let bookmark = editor.selection().get_bookmark(2);
-            editor.set_content(body);
-            editor.selection().move_to_bookmark(&bookmark);
-        } else {
-            editor.set_content(body);
+        if text_changed {
+            self.doc.update_text(&body_obj, &text);
+        }
+        if marks_changed {
+            self.doc.rewrite_marks(&body_obj, &delta);
+        }
+        self.doc.bump_version();
+        self.broadcast_doc();
+    }
+
+    /// Re-derive the editor's formatting from the CRDT's current mark spans.
+    /// Ranges only (no content insert/delete), so cursor position is unaffected.
+    fn resync_marks_to_editor(&mut self, body_obj: &ObjId) {
+        let len = self.doc.body_len(body_obj);
+        let marks = self.doc.marks(body_obj);
+        let Some(editor) = self.mode.editor() else {
+            return;
+        };
+        if len > 0 {
+            editor.remove_format(0, len, "silent");
+        }
+        for mark in marks {
+            let value = json_from_scalar(mark.value());
+            editor.format_text(
+                mark.start,
+                mark.end - mark.start,
+                mark.name(),
+                &value,
+                "silent",
+            );
         }
     }
+
+    /// Replace the editor's whole contents from the CRDT. Only for the paths
+    /// where incremental patching isn't possible (initial snapshot, mount).
+    fn reload_editor_contents(&mut self) {
+        let body = self.doc.get_body();
+        let body_obj = self.doc.body_obj();
+        let Some(editor) = self.mode.editor() else {
+            return;
+        };
+        editor.set_contents(&JsValue::NULL, "silent");
+        if !body.is_empty() {
+            editor.insert_text(0, &body, "silent");
+        }
+        if let Some(body_obj) = body_obj {
+            self.resync_marks_to_editor(&body_obj);
+        }
+    }
+
+    // --- presence -----------------------------------------------------
 
     fn set_editing(&mut self, editing: bool) {
         self.broadcast_my_state(editing);
@@ -498,9 +530,16 @@ impl App {
         }
     }
 
+    /// TODO: this sends the entire document — including its full history — on
+    /// every keystroke, so cost grows without bound as the document is edited.
+    /// Automerge offers `save_incremental()` and a sync protocol
+    /// (`automerge::sync::State`) for exactly this. Switching requires a
+    /// matching change in the relay, which currently *replaces* its stored
+    /// snapshot with whatever a client sends (`worker/src/index.ts`); it would
+    /// need to either accumulate incremental chunks or run Automerge itself to
+    /// merge. See "Known limitations" in worker/README.md.
     fn broadcast_doc(&mut self) {
         let data = self.doc.save();
-        log_1(&format!("[WS] Sending Content update, {} bytes", data.len()).into());
         self.send_ws(&WsMessage::Content(data));
     }
 
@@ -514,56 +553,84 @@ impl App {
         }
     }
 
-    fn init_tinymce(&mut self, ctx: &Context<Self>) {
-        if self.tinymce_initialized {
+    // --- editor lifecycle ---------------------------------------------
+
+    /// Quill's `snow` theme, given an array `toolbar` config, creates its own
+    /// `.ql-toolbar` element as a *sibling before* the container we mounted
+    /// it in — outside anything Yew's virtual DOM diffing tracks. Removing
+    /// only `#body-editor` (which Yew handles for us when the mode branch
+    /// unmounts) leaves that toolbar behind, so it must be torn down
+    /// explicitly here or it accumulates on every Edit/View toggle.
+    fn teardown_quill(&mut self) {
+        let editor = match std::mem::replace(&mut self.mode, Mode::View(None)) {
+            Mode::Edit(q) => Some(q),
+            Mode::View(q) => q,
+        };
+        let Some(editor) = editor else { return };
+        let toolbar_module = editor.get_module("toolbar");
+        if let Ok(container) = js_sys::Reflect::get(&toolbar_module, &"container".into()) {
+            if let Some(el) = container.dyn_ref::<web_sys::Element>() {
+                el.remove();
+            }
+        }
+    }
+
+    /// Mount Quill into `#body-editor`. View mode reuses the same editor,
+    /// disabled and without a toolbar, rather than hand-rendering HTML from
+    /// marks — that keeps one rendering path and avoids reconstructing
+    /// block-level formatting (headers, lists) by hand.
+    fn mount_quill(&mut self, ctx: &Context<Self>, editable: bool) {
+        let config = QuillConfig {
+            theme: "snow",
+            modules: QuillModules {
+                // Derived from MARK_NAMES so the toolbar and the marks we
+                // persist can never drift apart. View mode gets no toolbar.
+                toolbar: if editable {
+                    Toolbar::Names(MARK_NAMES)
+                } else {
+                    Toolbar::Disabled(false)
+                },
+            },
+            read_only: !editable,
+        };
+        let Ok(options) = serde_wasm_bindgen::to_value(&config) else {
+            log_1(&"[quill] Failed to serialize config".into());
+            return;
+        };
+        let editor = Quill::new("#body-editor", &options);
+        if !editable {
+            editor.enable(false);
+        }
+
+        self.mode = if editable {
+            Mode::Edit(editor)
+        } else {
+            Mode::View(Some(editor))
+        };
+
+        // Quill starts empty; load the current CRDT body and its formatting
+        // without firing text-change (source "silent"), so it isn't mistaken
+        // for a user edit.
+        self.reload_editor_contents();
+
+        if !editable {
             return;
         }
-        self.tinymce_initialized = true;
-
-        let link = ctx.link().clone();
-        let body_content = self.get_str(DOC_KEY_BODY);
-
-        let config = TinyMceConfig {
-            selector: "#body-editor",
-            inline: true,
-            menubar: true,
-            plugins: "lists link image table code",
-            toolbar: "formatselect | undo redo | bold italic underline | alignleft aligncenter alignright | outdent indent | bullist numlist | link image | code",
-            block_formats: "Paragraph=p;Heading 1=h1;Heading 2=h2;Heading 3=h3;Heading 4=h4",
-            license_key: "gpl",
+        let Some(editor) = self.mode.editor() else {
+            return;
         };
-        let options: js_sys::Object = serde_wasm_bindgen::to_value(&config)
-            .unwrap()
-            .unchecked_into();
-
-        let setup_fn = Closure::wrap(Box::new(move |editor: JsValue| {
-            let on_method = js_sys::Reflect::get(&editor, &"on".into()).unwrap();
-            let on_fn = on_method.unchecked_into::<js_sys::Function>();
-
-            // Set the initial content once the editor reports it is ready.
-            let body = body_content.clone();
-            let on_init = Closure::wrap(Box::new(move || {
-                if let Some(ed) = get("body-editor") {
-                    ed.set_content(&body);
+        let link = ctx.link().clone();
+        let on_text_change = Closure::wrap(Box::new(
+            move |_delta: JsValue, _old: JsValue, source: JsValue| {
+                // Programmatic ("silent") updates never reach this handler, so
+                // any event here is guaranteed to be real user input.
+                if source.as_string().as_deref() == Some("user") {
+                    link.send_message(Msg::QuillTextChanged);
                 }
-            }) as Box<dyn Fn()>);
-            let _ = on_fn.call2(&editor, &"init".into(), on_init.as_ref().unchecked_ref());
-            on_init.forget();
-
-            // Push local edits into the Automerge document.
-            let link_inner = link.clone();
-            let on_change = Closure::wrap(Box::new(move || {
-                link_inner.send_message(Msg::SyncBodyFromTinyMCE);
-            }) as Box<dyn Fn()>);
-            let _ = on_fn.call2(&editor, &"change".into(), on_change.as_ref().unchecked_ref());
-            let _ = on_fn.call2(&editor, &"keyup".into(), on_change.as_ref().unchecked_ref());
-            on_change.forget();
-        }) as Box<dyn Fn(JsValue)>);
-
-        js_sys::Reflect::set(&options, &"setup".into(), setup_fn.as_ref().unchecked_ref()).unwrap();
-        setup_fn.forget();
-
-        init(&options.into());
+            },
+        ) as Box<dyn FnMut(JsValue, JsValue, JsValue)>);
+        editor.on("text-change", on_text_change.as_ref().unchecked_ref());
+        on_text_change.forget();
     }
 }
 

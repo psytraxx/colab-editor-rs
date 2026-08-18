@@ -4,52 +4,146 @@
     <meta charset="utf-8" />
     <title>Collaborative Editor</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    <script src="tinymce/tinymce.min.js"></script>
-    <link data-trunk rel="copy-dir" href="static/tinymce" />
+    <link href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js"></script>
     <style>
-      body { max-width: 800px; margin: 0 auto; padding: 20px; }
-      .field { margin-bottom: 15px; }
-      .inline-editor {
-        min-height: 200px;
-        border: 1px solid var(--pico-form-element-border-color);
+      main.container {
+        max-width: 760px;
+        padding-block: 2.5rem;
+      }
+
+      /* Page header: connection status + presence */
+      .app-header {
+        margin-bottom: 1.5rem;
+      }
+      .version-pill {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--pico-muted-color);
+        background: var(--pico-card-sectioning-background-color);
+        border: 1px solid var(--pico-muted-border-color);
+        border-radius: 999px;
+        padding: 0.15rem 0.6rem;
+      }
+      .connection-status {
+        margin-bottom: 0.75rem;
+        font-size: 0.85rem;
+      }
+      .connection-status mark {
         border-radius: var(--pico-border-radius);
-        padding: 1rem;
-        background-color: var(--pico-form-element-background-color);
       }
-      .inline-editor:focus {
-        border-color: var(--pico-form-element-active-border-color);
-        outline: none;
-      }
-      .body-content {
-        min-height: 100px;
-        padding: 1rem;
-        background: var(--pico-card-background-color);
-        border-radius: var(--pico-border-radius);
-      }
-      
-      /* Online users */
+
+      /* Presence badges */
       .online-users {
         display: flex;
-        gap: 6px;
+        gap: 0.4rem;
         flex-wrap: wrap;
       }
       .user-badge {
-        padding: 4px 10px;
-        border-radius: 16px;
-        display: flex;
+        padding: 0.3rem 0.75rem;
+        border-radius: 999px;
+        display: inline-flex;
         align-items: center;
-        gap: 6px;
+        gap: 0.4rem;
         font-weight: 500;
-        font-size: 12px;
-        transition: all 0.2s;
-        background-color: #f5f5f5;
-        color: #333;
-        border: 1px solid #ddd;
+        font-size: 0.75rem;
+        transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+        background-color: var(--pico-card-sectioning-background-color);
+        color: var(--pico-muted-color);
+        border: 1px solid var(--pico-muted-border-color);
       }
       .user-badge.editing {
-        background-color: #4caf50;
-        color: white;
-        border-color: #4caf50;
+        background-color: var(--pico-ins-color);
+        color: var(--pico-contrast-inverse);
+        border-color: var(--pico-ins-color);
+      }
+
+      /* Content card (view/edit article) */
+      .content-card {
+        padding: 2rem;
+      }
+
+      /* View/Edit mode switch (Pico's native switch component) */
+      .mode-switch-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+      }
+      .mode-switch {
+        margin-bottom: 0;
+      }
+      .mode-switch label {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        font-size: 0.9rem;
+        font-weight: 500;
+      }
+      .mode-switch input[type="checkbox"] {
+        margin-bottom: 0;
+      }
+
+      /* View mode */
+      .keyword-chips {
+        display: flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+        margin-bottom: 1.5rem;
+      }
+      .keyword-chip {
+        font-size: 0.75rem;
+        font-weight: 500;
+        color: var(--pico-primary);
+        background: var(--pico-card-sectioning-background-color);
+        border: 1px solid var(--pico-primary);
+        border-radius: 999px;
+        padding: 0.2rem 0.7rem;
+      }
+      .body-content {
+        min-height: 100px;
+        line-height: 1.6;
+      }
+
+      /* Edit mode */
+      .field {
+        margin-bottom: 1.5rem;
+      }
+      .field > label {
+        font-weight: 600;
+        font-size: 0.85rem;
+        margin-bottom: 0.35rem;
+      }
+      .quill-editor {
+        border: 1px solid var(--pico-form-element-border-color);
+        border-radius: var(--pico-border-radius);
+        background-color: var(--pico-form-element-background-color);
+      }
+      .quill-editor .ql-toolbar {
+        border: none;
+        border-bottom: 1px solid var(--pico-form-element-border-color);
+        border-radius: var(--pico-border-radius) var(--pico-border-radius) 0 0;
+      }
+      .quill-editor .ql-container {
+        border: none;
+        min-height: 220px;
+        font-size: 1rem;
+      }
+      /* View mode reuses Quill read-only: strip the input chrome so it reads
+         as prose rather than as a disabled form field. */
+      .quill-readonly {
+        border: none;
+        background: none;
+      }
+      .quill-readonly .ql-editor {
+        padding: 0;
+      }
+      .quill-readonly .ql-container {
+        /* The snow theme borders its container; view mode is prose, not a
+           form field, so clear it. */
+        border: none;
+        min-height: 0;
       }
     </style>
   </head>

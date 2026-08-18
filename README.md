@@ -6,7 +6,7 @@ A **collaborative text editor** built with Rust, WebAssembly, and Automerge CRDT
 
 - **Conflict-Free Sync**: Uses Automerge CRDT for automatic conflict resolution
 - **Real-time Collaboration**: See other users' edits and presence in real-time
-- **Rich Text Editing**: Powered by TinyMCE for WYSIWYG editing
+- **Rich Text Editing**: Powered by Quill for WYSIWYG editing
 - **User Presence**: Visual indicators showing who's online and who's currently editing
 - **Serverless Hosting**: The relay runs on a Cloudflare Worker + Durable Object — no traditional backend to operate
 
@@ -32,7 +32,7 @@ This is a **client + relay** design, not peer-to-peer:
 - **Rust** + **WebAssembly** for client-side logic
 - **Yew** framework for reactive UI
 - **Automerge** CRDT for distributed state management
-- **TinyMCE** for rich text editing
+- **Quill** for rich text editing
 - **Trunk** for WASM build tooling
 - **Cloudflare Workers + Durable Objects** for the WebSocket relay (see `worker/README.md`)
 
@@ -71,7 +71,7 @@ npm run deploy   # deploy to Cloudflare
 
 1. **Start the app**: Open it in your browser; it connects to the relay automatically.
 2. **View mode**: Read-only rendered view of the document.
-3. **Edit mode**: Click "Edit" to open the TinyMCE editor and start collaborating — all connected clients see changes in near real-time.
+3. **Edit mode**: Toggle "Edit mode" to open the Quill editor and start collaborating — all connected clients see changes in near real-time.
 
 ## Project Structure
 
@@ -79,9 +79,12 @@ npm run deploy   # deploy to Cloudflare
 colab-editor-rs/
 ├── client/            # Rust/WASM client (Yew UI + Automerge doc + WebSocket)
 │   ├── src/
-│   │   └── main.rs    # App component, WS handling, Automerge sync, TinyMCE bindings
+│   │   ├── main.rs    # App component, WS handling, editor lifecycle
+│   │   ├── doc.rs     # Automerge document model and accessors
+│   │   ├── marks.rs   # Quill Delta attributes <-> Automerge marks
+│   │   ├── protocol.rs # Wire protocol shared with the worker
+│   │   └── quill.rs   # Quill JS bindings and Delta types
 │   ├── index.html     # Entry HTML
-│   └── static/         # Static assets (TinyMCE, etc.)
 └── worker/            # Cloudflare Worker relay (Durable Object)
     └── src/
         └── index.ts   # HTTP router + EditorRoom Durable Object
